@@ -5,6 +5,7 @@
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
 #include <string>
+#include <atomic>
 #include <VersionHelpers.hpp>
 #include <WeaselIPCData.h>
 #include <algorithm>
@@ -27,6 +28,7 @@
 
 #pragma comment(lib, "Shcore.lib")
 #pragma comment(lib, "Dwmapi.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 namespace {
 
@@ -79,151 +81,237 @@ LRESULT CALLBACK AcrylicBackdropWndProc(HWND hwnd,
   }
 }
 
+HMODULE AcrylicWindowModule() {
+  static int moduleAnchor = 0;
+  HMODULE module = nullptr;
+  if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&moduleAnchor), &module))
+    return nullptr;
+  return module;
+}
+
 bool EnsureAcrylicBackdropClass() {
+  const HMODULE module = AcrylicWindowModule();
+  if (!module)
+    return false;
   WNDCLASSEXW wc = {};
   wc.cbSize = sizeof(wc);
   wc.lpfnWndProc = AcrylicBackdropWndProc;
-  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.hInstance = module;
   wc.lpszClassName = kWeaselAcrylicBackdropClass;
 
   if (RegisterClassExW(&wc))
     return true;
 
-  return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+  if (::GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    return false;
+  WNDCLASSEXW existing{};
+  existing.cbSize = sizeof(existing);
+  return ::GetClassInfoExW(module, kWeaselAcrylicBackdropClass, &existing) &&
+         existing.lpfnWndProc == AcrylicBackdropWndProc;
 }
 
 constexpr wchar_t kWeaselAcrylicAppSdkDll[] = L"WeaselAcrylicAppSdk.dll";
 constexpr wchar_t kWeaselAcrylicAppSdkActiveProperty[] =
     L"WeaselAcrylicAppSdkActive";
+constexpr wchar_t kAcrylicStageProperty[] = L"WeaselAcrylicAppSdkStage";
+constexpr wchar_t kAcrylicHrProperty[] = L"WeaselAcrylicAppSdkHresult";
+constexpr wchar_t kAcrylicPolicyProperty[] = L"WeaselAcrylicAppSdkPolicy";
+
+void SetAcrylicDiagnostic(HWND hwnd, LONG stage, HRESULT hr) {
+  ::SetPropW(hwnd, kAcrylicPolicyProperty,
+             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(3)));
+  ::SetPropW(hwnd, kAcrylicStageProperty,
+             reinterpret_cast<HANDLE>(
+                 static_cast<ULONG_PTR>(static_cast<DWORD>(stage))));
+  ::SetPropW(
+      hwnd, kAcrylicHrProperty,
+      reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(static_cast<DWORD>(hr))));
+}
+
+// The installer/TSF language-bar code use the HKLM WeaselRoot value. In an
+// in-process TSF client, GetModuleFileName(nullptr) is WINWORD/Chrome, not
+// Rime.
+HRESULT ReadAcrylicInstallRoot(std::wstring& root) {
+  const DWORD views[] = {RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY};
+  for (DWORD view : views) {
+    WCHAR value[32768] = {};
+    DWORD bytes = sizeof(value);
+    const LSTATUS result = ::RegGetValueW(
+        HKEY_LOCAL_MACHINE, L"Software\\Rime\\Weasel", L"WeaselRoot",
+        RRF_RT_REG_SZ | view, nullptr, value, &bytes);
+    if (result != ERROR_SUCCESS)
+      continue;
+    root = value;
+    while (!root.empty() && (root.back() == L'\\' || root.back() == L'/'))
+      root.pop_back();
+    // Only a local absolute installation path; no CWD/PATH, HKCU, or network
+    // directory is used to locate executable plugin code in another process.
+    if (root.size() >= 3 &&
+        ((root[0] >= L'A' && root[0] <= L'Z') ||
+         (root[0] >= L'a' && root[0] <= L'z')) &&
+        root[1] == L':' && (root[2] == L'\\' || root[2] == L'/'))
+      return S_OK;
+    return HRESULT_FROM_WIN32(ERROR_BAD_PATHNAME);
+  }
+  return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+}
 
 class AcrylicAppSdkBridge {
  public:
-  bool TryInitialize(HWND hwnd, BOOL darkMode) {
-    if (lifecycleBusy_ || !hwnd || !::IsWindow(hwnd))
+  bool TryInitialize(HWND hwnd, BOOL darkMode, bool inServer) {
+    if (!hwnd || !::IsWindow(hwnd))
       return false;
-
-    const DWORD currentThread = ::GetCurrentThreadId();
-    if (ownerThread_ && ownerThread_ != currentThread)
+#if !defined(_M_X64) || defined(_M_ARM64EC)
+    // The current build packages an x64 helper only. Keep Win32/ARM clients
+    // functional without attempting to load a DLL of the wrong architecture.
+    SetAcrylicDiagnostic(hwnd, -10,
+                         HRESULT_FROM_WIN32(ERROR_EXE_MACHINE_TYPE_MISMATCH));
+    return false;
+#else
+    // Protect against re-entry during LoadLibrary/bootstrap on the same UI
+    // thread. The native loader cache is shared, but targets live in helper
+    // TLS.
+    static thread_local bool entering = false;
+    if (entering) {
+      SetAcrylicDiagnostic(hwnd, -11, HRESULT_FROM_WIN32(ERROR_BUSY));
       return false;
-    ownerThread_ = currentThread;
-
-    // This PoC supports one live target on the server UI thread. A second
-    // panel must not detach the first panel or close its Composition objects.
-    if (target_) {
-      if (target_ != hwnd || !active_)
-        return false;
-      SetDarkMode(hwnd, darkMode);
-      return true;
     }
-
-    lifecycleBusy_ = true;
-    struct BusyScope {
+    entering = true;
+    struct EntryScope {
       bool& flag;
-      ~BusyScope() { flag = false; }
-    } busyScope{lifecycleBusy_};
-
-    if (!LoadOnce())
-      return false;
-
-    if (!initialize_(hwnd, darkMode) || !isActive_() || !::IsWindow(hwnd)) {
-      // Policy v2 releases target resources only; it leaves the UI queue alive.
-      detach_();
+      ~EntryScope() { flag = false; }
+    } scope{entering};
+    LoadRequest request{this, inServer};
+    if (!::InitOnceExecuteOnce(&once_, LoadCallback, &request, nullptr)) {
+      SetAcrylicDiagnostic(hwnd, -20, HRESULT_FROM_WIN32(::GetLastError()));
       return false;
     }
-
-    target_ = hwnd;
-    active_ = true;
-    darkMode_ = darkMode;
-    return true;
+    if (!ready_.load()) {
+      SetAcrylicDiagnostic(hwnd, loadStage_, loadResult_);
+      return false;
+    }
+    const BOOL ok = attach_(hwnd, darkMode);
+    SetAcrylicDiagnostic(hwnd, lastStage_(), lastHr_());
+    return ok && isWindowActive_(hwnd) && ::IsWindow(hwnd);
+#endif
   }
 
   void SetDarkMode(HWND hwnd, BOOL darkMode) {
-    if (lifecycleBusy_ || !active_ || hwnd != target_ ||
-        ownerThread_ != ::GetCurrentThreadId() || darkMode_ == darkMode)
-      return;
-    setDarkMode_(darkMode);
-    darkMode_ = darkMode;
+    if (ready_.load() && hwnd)
+      setWindowTheme_(hwnd, darkMode);
   }
 
   void DetachWindow(HWND hwnd) {
-    if (lifecycleBusy_ || !hwnd || hwnd != target_ ||
-        ownerThread_ != ::GetCurrentThreadId())
-      return;
+    if (ready_.load() && hwnd)
+      detach_(hwnd);
+  }
 
-    // Clear ownership before calling out. OnDestroy and the destructor may
-    // both reach this method; the second call must be a no-op.
-    target_ = nullptr;
-    active_ = false;
-    lifecycleBusy_ = true;
-    if (detach_)
-      detach_();
-    lifecycleBusy_ = false;
+  void RequestThreadShutdownIfLoaded() {
+    if (ready_.load())
+      requestShutdown_();
   }
 
  private:
-  using InitializeFn = BOOL(WINAPI*)(HWND, BOOL);
-  using SetDarkModeFn = void(WINAPI*)(BOOL);
-  using IsActiveFn = BOOL(WINAPI*)();
-  using DetachFn = void(WINAPI*)();
-  using LifetimeVersionFn = LONG(WINAPI*)();
+  using AttachFn = BOOL(WINAPI*)(HWND, BOOL);
+  using ThemeFn = void(WINAPI*)(HWND, BOOL);
+  using ActiveFn = BOOL(WINAPI*)(HWND);
+  using DetachFn = void(WINAPI*)(HWND);
+  using RequestShutdownFn = HRESULT(WINAPI*)();
+  using DiagnosticFn = LONG(WINAPI*)();
+  struct LoadRequest {
+    AcrylicAppSdkBridge* self;
+    bool inServer;
+  };
 
-  bool LoadOnce() {
-    if (loadAttempted_)
-      return ready_;
-    loadAttempted_ = true;
+  static BOOL CALLBACK LoadCallback(PINIT_ONCE, PVOID parameter, PVOID*) {
+    auto request = static_cast<LoadRequest*>(parameter);
+    auto self = request->self;
+    try {
+      self->Load(request->inServer);
+    } catch (...) {
+      self->loadResult_ = E_UNEXPECTED;
+    }
+    // Cache failure too; do not load a runtime on every keystroke. After fixing
+    // installation/runtime, restart the host app to retry with a clean graph.
+    return TRUE;
+  }
 
-    WCHAR executablePath[32768] = {};
-    const DWORD length =
-        ::GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
-    if (!length || length >= _countof(executablePath))
-      return false;
-
-    std::wstring helperPath(executablePath, length);
-    const auto slash = helperPath.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-      return false;
-    helperPath.resize(slash + 1);
-    helperPath += kWeaselAcrylicAppSdkDll;
-
+  void Load(bool inServer) {
+    loadStage_ = -20;
+    std::wstring root;
+    loadResult_ = ReadAcrylicInstallRoot(root);
+    if (FAILED(loadResult_) && inServer) {
+      // Developer/server fallback ONLY. Never follow Word's executable path.
+      WCHAR executable[32768] = {};
+      const DWORD length =
+          ::GetModuleFileNameW(nullptr, executable, _countof(executable));
+      if (length && length < _countof(executable)) {
+        root.assign(executable, length);
+        const auto slash = root.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+          root.resize(slash);
+          loadResult_ = S_OK;
+        }
+      }
+    }
+    if (FAILED(loadResult_))
+      return;
+    std::wstring helperPath = root + L"\\" + kWeaselAcrylicAppSdkDll;
+    loadStage_ = -30;
     module_ = ::LoadLibraryExW(
         helperPath.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!module_)
-      return false;
-
-    // Keep this one loader reference for the process lifetime, including
-    // failure paths. Never unload a runtime with pending asynchronous work.
-    // The helper additionally pins itself before creating WinRT objects.
-    auto lifetimeVersion = reinterpret_cast<LifetimeVersionFn>(::GetProcAddress(
+    if (!module_) {
+      const DWORD error = ::GetLastError();
+      loadResult_ = error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+      return;
+    }
+    // Keep one reference for process lifetime. Runtime objects/queues are NOT
+    // unloaded when a composition ends. Policy version stops old DLL mixing.
+    loadStage_ = -40;
+    auto policy = reinterpret_cast<DiagnosticFn>(::GetProcAddress(
         module_, "WeaselAcrylicAppSdkGetLifetimePolicyVersion"));
-    if (!lifetimeVersion || lifetimeVersion() != 2)
-      return false;
-
-    initialize_ = reinterpret_cast<InitializeFn>(
-        ::GetProcAddress(module_, "WeaselAcrylicAppSdkInitialize"));
-    setDarkMode_ = reinterpret_cast<SetDarkModeFn>(
-        ::GetProcAddress(module_, "WeaselAcrylicAppSdkSetDarkMode"));
-    isActive_ = reinterpret_cast<IsActiveFn>(
-        ::GetProcAddress(module_, "WeaselAcrylicAppSdkIsActive"));
+    if (!policy || policy() != 3) {
+      loadResult_ = HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
+      return;
+    }
+    attach_ = reinterpret_cast<AttachFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkAttach"));
+    setWindowTheme_ = reinterpret_cast<ThemeFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkSetWindowTheme"));
+    isWindowActive_ = reinterpret_cast<ActiveFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkIsWindowActive"));
     detach_ = reinterpret_cast<DetachFn>(
-        ::GetProcAddress(module_, "WeaselAcrylicAppSdkShutdown"));
-
-    ready_ = initialize_ && setDarkMode_ && isActive_ && detach_;
-    return ready_;
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkDetach"));
+    requestShutdown_ = reinterpret_cast<RequestShutdownFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkRequestThreadShutdown"));
+    lastStage_ = reinterpret_cast<DiagnosticFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkGetLastStage"));
+    lastHr_ = reinterpret_cast<DiagnosticFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkGetLastHresult"));
+    if (!attach_ || !setWindowTheme_ || !isWindowActive_ || !detach_ ||
+        !requestShutdown_ || !lastStage_ || !lastHr_) {
+      loadResult_ = HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+      return;
+    }
+    loadResult_ = S_OK;
+    ready_.store(true);
   }
 
+  INIT_ONCE once_ = INIT_ONCE_STATIC_INIT;
+  std::atomic<bool> ready_{false};
   HMODULE module_ = nullptr;
-  InitializeFn initialize_ = nullptr;
-  SetDarkModeFn setDarkMode_ = nullptr;
-  IsActiveFn isActive_ = nullptr;
+  AttachFn attach_ = nullptr;
+  ThemeFn setWindowTheme_ = nullptr;
+  ActiveFn isWindowActive_ = nullptr;
   DetachFn detach_ = nullptr;
-  HWND target_ = nullptr;
-  DWORD ownerThread_ = 0;
-  BOOL darkMode_ = FALSE;
-  bool lifecycleBusy_ = false;
-  bool loadAttempted_ = false;
-  bool ready_ = false;
-  bool active_ = false;
+  RequestShutdownFn requestShutdown_ = nullptr;
+  DiagnosticFn lastStage_ = nullptr;
+  DiagnosticFn lastHr_ = nullptr;
+  LONG loadStage_ = -20;
+  HRESULT loadResult_ = E_PENDING;
 };
 
 AcrylicAppSdkBridge g_acrylicAppSdkBridge;
@@ -298,6 +386,10 @@ WeaselPanel::WeaselPanel(weasel::UI& ui)
 
 WeaselPanel::~WeaselPanel() {
   _DestroyAcrylicBackdrop();
+  // Only full client UI destruction (e.g. TSF Deactivate), not each Esc.
+  // This requests asynchronous cleanup on the normal host message loop.
+  if (!m_in_server)
+    g_acrylicAppSdkBridge.RequestThreadShutdownIfLoaded();
   Gdiplus::GdiplusShutdown(_m_gdiplusToken);
   delete m_layout;
   m_layout = NULL;
@@ -313,8 +405,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   m_acrylicBackdrop = CreateWindowExW(
       WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
       kWeaselAcrylicBackdropClass, L"", WS_POPUP, 0, 0, 0, 0,
-      ::GetWindow(m_hWnd, GW_OWNER), nullptr, GetModuleHandleW(nullptr),
-      nullptr);
+      ::GetWindow(m_hWnd, GW_OWNER), nullptr, AcrylicWindowModule(), nullptr);
 
   if (!m_acrylicBackdrop)
     return false;
@@ -345,11 +436,11 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseImmersiveDarkMode,
                         &useDarkMode, sizeof(useDarkMode));
 
-  // Stage B.2b: prefer the verified Windows App SDK Desktop Acrylic path.
-  // Weasel itself stays independent from Windows App SDK headers/libraries;
-  // the helper is loaded dynamically beside WeaselServer.exe.
-  if (m_in_server &&
-      g_acrylicAppSdkBridge.TryInitialize(m_acrylicBackdrop, useDarkMode)) {
+  // B.2c: both server and TSF client HWNDs use the installed optional helper.
+  // The helper resolves the runtime explicitly and owns targets per UI thread.
+  // A failure keeps the existing DWM fallback and records Stage/HRESULT.
+  if (g_acrylicAppSdkBridge.TryInitialize(m_acrylicBackdrop, useDarkMode,
+                                          m_in_server)) {
     ::SetPropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty,
                reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1)));
     m_acrylicBackdropEnabled = true;

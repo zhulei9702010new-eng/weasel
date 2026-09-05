@@ -46,7 +46,8 @@
 
   <PropertyGroup>
     <WindowsPackageType>None</WindowsPackageType>
-    <WindowsAppSdkBootstrapInitialize>true</WindowsAppSdkBootstrapInitialize>
+    <!-- Optional TSF plugin: never auto-bootstrap while LoadLibrary holds the loader lock. -->
+    <WindowsAppSdkBootstrapInitialize>false</WindowsAppSdkBootstrapInitialize>
     <WindowsAppSdkDeploymentManagerInitialize>false</WindowsAppSdkDeploymentManagerInitialize>
     <WindowsAppSdkUndockedRegFreeWinRTInitialize>false</WindowsAppSdkUndockedRegFreeWinRTInitialize>
     <WinUISDKReferences>false</WinUISDKReferences>
