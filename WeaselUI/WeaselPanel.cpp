@@ -99,48 +99,79 @@ constexpr wchar_t kWeaselAcrylicAppSdkActiveProperty[] =
 class AcrylicAppSdkBridge {
  public:
   bool TryInitialize(HWND hwnd, BOOL darkMode) {
-    ShutdownAndUnload();
-
-    if (!Load())
+    if (lifecycleBusy_ || !hwnd || !::IsWindow(hwnd))
       return false;
 
-    if (!initialize_(hwnd, darkMode)) {
-      Unload();
+    const DWORD currentThread = ::GetCurrentThreadId();
+    if (ownerThread_ && ownerThread_ != currentThread)
+      return false;
+    ownerThread_ = currentThread;
+
+    // This PoC supports one live target on the server UI thread. A second
+    // panel must not detach the first panel or close its Composition objects.
+    if (target_) {
+      if (target_ != hwnd || !active_)
+        return false;
+      SetDarkMode(hwnd, darkMode);
+      return true;
+    }
+
+    lifecycleBusy_ = true;
+    struct BusyScope {
+      bool& flag;
+      ~BusyScope() { flag = false; }
+    } busyScope{lifecycleBusy_};
+
+    if (!LoadOnce())
+      return false;
+
+    if (!initialize_(hwnd, darkMode) || !isActive_() || !::IsWindow(hwnd)) {
+      // Policy v2 releases target resources only; it leaves the UI queue alive.
+      detach_();
       return false;
     }
 
-    if (!isActive_()) {
-      shutdown_();
-      Unload();
-      return false;
-    }
-
+    target_ = hwnd;
     active_ = true;
+    darkMode_ = darkMode;
     return true;
   }
 
-  void SetDarkMode(BOOL darkMode) {
-    if (active_ && setDarkMode_)
-      setDarkMode_(darkMode);
+  void SetDarkMode(HWND hwnd, BOOL darkMode) {
+    if (lifecycleBusy_ || !active_ || hwnd != target_ ||
+        ownerThread_ != ::GetCurrentThreadId() || darkMode_ == darkMode)
+      return;
+    setDarkMode_(darkMode);
+    darkMode_ = darkMode;
   }
 
-  bool IsActive() const { return active_; }
+  void DetachWindow(HWND hwnd) {
+    if (lifecycleBusy_ || !hwnd || hwnd != target_ ||
+        ownerThread_ != ::GetCurrentThreadId())
+      return;
 
-  void ShutdownAndUnload() {
-    if (active_ && shutdown_)
-      shutdown_();
-
+    // Clear ownership before calling out. OnDestroy and the destructor may
+    // both reach this method; the second call must be a no-op.
+    target_ = nullptr;
     active_ = false;
-    Unload();
+    lifecycleBusy_ = true;
+    if (detach_)
+      detach_();
+    lifecycleBusy_ = false;
   }
 
  private:
   using InitializeFn = BOOL(WINAPI*)(HWND, BOOL);
   using SetDarkModeFn = void(WINAPI*)(BOOL);
   using IsActiveFn = BOOL(WINAPI*)();
-  using ShutdownFn = void(WINAPI*)();
+  using DetachFn = void(WINAPI*)();
+  using LifetimeVersionFn = LONG(WINAPI*)();
 
-  bool Load() {
+  bool LoadOnce() {
+    if (loadAttempted_)
+      return ready_;
+    loadAttempted_ = true;
+
     WCHAR executablePath[32768] = {};
     const DWORD length =
         ::GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
@@ -151,7 +182,6 @@ class AcrylicAppSdkBridge {
     const auto slash = helperPath.find_last_of(L"\\/");
     if (slash == std::wstring::npos)
       return false;
-
     helperPath.resize(slash + 1);
     helperPath += kWeaselAcrylicAppSdkDll;
 
@@ -161,40 +191,38 @@ class AcrylicAppSdkBridge {
     if (!module_)
       return false;
 
+    // Keep this one loader reference for the process lifetime, including
+    // failure paths. Never unload a runtime with pending asynchronous work.
+    // The helper additionally pins itself before creating WinRT objects.
+    auto lifetimeVersion = reinterpret_cast<LifetimeVersionFn>(::GetProcAddress(
+        module_, "WeaselAcrylicAppSdkGetLifetimePolicyVersion"));
+    if (!lifetimeVersion || lifetimeVersion() != 2)
+      return false;
+
     initialize_ = reinterpret_cast<InitializeFn>(
         ::GetProcAddress(module_, "WeaselAcrylicAppSdkInitialize"));
     setDarkMode_ = reinterpret_cast<SetDarkModeFn>(
         ::GetProcAddress(module_, "WeaselAcrylicAppSdkSetDarkMode"));
     isActive_ = reinterpret_cast<IsActiveFn>(
         ::GetProcAddress(module_, "WeaselAcrylicAppSdkIsActive"));
-    shutdown_ = reinterpret_cast<ShutdownFn>(
+    detach_ = reinterpret_cast<DetachFn>(
         ::GetProcAddress(module_, "WeaselAcrylicAppSdkShutdown"));
 
-    if (!initialize_ || !setDarkMode_ || !isActive_ || !shutdown_) {
-      Unload();
-      return false;
-    }
-
-    return true;
-  }
-
-  void Unload() {
-    initialize_ = nullptr;
-    setDarkMode_ = nullptr;
-    isActive_ = nullptr;
-    shutdown_ = nullptr;
-
-    if (module_) {
-      ::FreeLibrary(module_);
-      module_ = nullptr;
-    }
+    ready_ = initialize_ && setDarkMode_ && isActive_ && detach_;
+    return ready_;
   }
 
   HMODULE module_ = nullptr;
   InitializeFn initialize_ = nullptr;
   SetDarkModeFn setDarkMode_ = nullptr;
   IsActiveFn isActive_ = nullptr;
-  ShutdownFn shutdown_ = nullptr;
+  DetachFn detach_ = nullptr;
+  HWND target_ = nullptr;
+  DWORD ownerThread_ = 0;
+  BOOL darkMode_ = FALSE;
+  bool lifecycleBusy_ = false;
+  bool loadAttempted_ = false;
+  bool ready_ = false;
   bool active_ = false;
 };
 
@@ -320,7 +348,8 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   // Stage B.2b: prefer the verified Windows App SDK Desktop Acrylic path.
   // Weasel itself stays independent from Windows App SDK headers/libraries;
   // the helper is loaded dynamically beside WeaselServer.exe.
-  if (g_acrylicAppSdkBridge.TryInitialize(m_acrylicBackdrop, useDarkMode)) {
+  if (m_in_server &&
+      g_acrylicAppSdkBridge.TryInitialize(m_acrylicBackdrop, useDarkMode)) {
     ::SetPropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty,
                reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1)));
     m_acrylicBackdropEnabled = true;
@@ -350,13 +379,11 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
 }
 void WeaselPanel::_DestroyAcrylicBackdrop() {
   m_acrylicBackdropEnabled = false;
-
-  // Release Composition objects before destroying their target HWND.
-  g_acrylicAppSdkBridge.ShutdownAndUnload();
-
   if (m_acrylicBackdrop) {
     ::RemovePropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty);
     ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
+    // Detach this HWND only. Neither unload the DLL nor stop the UI queue.
+    g_acrylicAppSdkBridge.DetachWindow(m_acrylicBackdrop);
     ::DestroyWindow(m_acrylicBackdrop);
     m_acrylicBackdrop = NULL;
   }
@@ -369,8 +396,7 @@ void WeaselPanel::_UpdateAcrylicBackdropTheme() {
   DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseImmersiveDarkMode,
                         &useDarkMode, sizeof(useDarkMode));
 
-  if (g_acrylicAppSdkBridge.IsActive())
-    g_acrylicAppSdkBridge.SetDarkMode(useDarkMode);
+  g_acrylicAppSdkBridge.SetDarkMode(m_acrylicBackdrop, useDarkMode);
 }
 bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
   if (!m_acrylicBackdropEnabled || !m_acrylicBackdrop || !m_layout ||

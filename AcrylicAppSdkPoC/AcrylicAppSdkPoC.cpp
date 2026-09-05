@@ -1,9 +1,11 @@
 #include <windows.h>
 #include <dispatcherqueue.h>
+#include <roapi.h>
 #include <dwmapi.h>
 #include <windows.ui.composition.interop.h>
 
 #include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Microsoft.UI.h>
 #include <winrt/Microsoft.UI.Composition.SystemBackdrops.h>
 #include <winrt/Microsoft.UI.Interop.h>
@@ -14,6 +16,7 @@
 
 #pragma comment(lib, "Dwmapi.lib")
 #pragma comment(lib, "CoreMessaging.lib")
+#pragma comment(lib, "RuntimeObject.lib")
 #pragma comment(lib, "OneCoreUAP.lib")
 
 namespace {
@@ -23,6 +26,7 @@ constexpr DWORD kDwmaUseHostBackdropBrush = 17;
 enum class AcrylicDiagnosticStage : LONG {
   kNone = 0,
   kEnteredInitialize = 1,
+  kApartment = 5,
   kIsSupported = 10,
   kHostBackdropBrush = 20,
   kDispatcherQueue = 30,
@@ -33,10 +37,49 @@ enum class AcrylicDiagnosticStage : LONG {
   kAcrylicController = 80,
   kSetTarget = 90,
   kComplete = 100,
+  kThreadShutdown = 110,
+  kThreadShutdownComplete = 120,
 };
 
 LONG g_lastStage = static_cast<LONG>(AcrylicDiagnosticStage::kNone);
 HRESULT g_lastHresult = S_OK;
+
+// B.2b lifecycle policy v2: detach windows separately from UI-thread shutdown.
+// The helper is pinned before it starts asynchronous/WinRT work.
+DWORD g_uiThreadId = 0;
+bool g_roInitialized = false;
+bool g_runtimeStopping = false;
+bool g_shutdownInProgress = false;
+int g_modulePinAnchor = 0;
+winrt::Windows::Foundation::IAsyncAction g_queueShutdownAction{nullptr};
+
+HRESULT PrepareUiThreadRuntime() {
+  const DWORD threadId = ::GetCurrentThreadId();
+  if (g_runtimeStopping)
+    return HRESULT_FROM_WIN32(ERROR_SHUTDOWN_IN_PROGRESS);
+  if (g_uiThreadId && g_uiThreadId != threadId)
+    return RPC_E_WRONG_THREAD;
+  if (g_uiThreadId)
+    return S_OK;
+
+  HMODULE pinnedModule = nullptr;
+  if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&g_modulePinAnchor),
+                            &pinnedModule)) {
+    const DWORD error = ::GetLastError();
+    return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+  }
+
+  // CoInitialize(STA) alone is not our WinRT ownership contract. Balance
+  // this successful call (including S_FALSE) only at final UI-thread shutdown.
+  const HRESULT hr = ::RoInitialize(RO_INIT_SINGLETHREADED);
+  if (FAILED(hr))
+    return hr;
+  g_roInitialized = true;
+  g_uiThreadId = threadId;
+  return S_OK;
+}
 
 void SetDiagnostic(AcrylicDiagnosticStage stage, HRESULT hr = S_OK) {
   g_lastStage = static_cast<LONG>(stage);
@@ -76,20 +119,22 @@ void ResetBackdropObjects() {
     } catch (...) {
     }
   }
-
   g_acrylicController = nullptr;
   g_backdropConfiguration = nullptr;
+
+  if (g_desktopTarget != nullptr) {
+    try {
+      g_desktopTarget.Root(nullptr);
+      g_desktopTarget.Close();
+    } catch (...) {
+    }
+  }
   g_rootVisual = nullptr;
   g_desktopTarget = nullptr;
   g_compositor = nullptr;
 
-  if (g_systemDispatcherQueueController != nullptr) {
-    try {
-      g_systemDispatcherQueueController.ShutdownQueueAsync();
-    } catch (...) {
-    }
-  }
-  g_systemDispatcherQueueController = nullptr;
+  // Target lifetime is shorter than UI-thread lifetime. Keep our system queue
+  // running across candidate HWND recreation. Only ShutdownThread may stop it.
 }
 
 }  // namespace
@@ -114,6 +159,14 @@ extern "C" __declspec(dllexport) BOOL __stdcall WeaselAcrylicAppSdkInitialize(
       SetDiagnostic(AcrylicDiagnosticStage::kEnteredInitialize, E_INVALIDARG);
       return FALSE;
     }
+
+    SetDiagnostic(AcrylicDiagnosticStage::kApartment);
+    const HRESULT runtimeHr = PrepareUiThreadRuntime();
+    if (FAILED(runtimeHr)) {
+      g_lastHresult = runtimeHr;
+      return FALSE;
+    }
+    ResetBackdropObjects();
 
     SetDiagnostic(AcrylicDiagnosticStage::kIsSupported);
     if (!winrt::Microsoft::UI::Composition::SystemBackdrops::
@@ -232,5 +285,97 @@ extern "C" __declspec(dllexport) BOOL __stdcall WeaselAcrylicAppSdkIsActive() {
 }
 
 extern "C" __declspec(dllexport) void __stdcall WeaselAcrylicAppSdkShutdown() {
+  // Kept for ABI compatibility: policy v2 means window detach, not thread stop.
+  if (g_uiThreadId && g_uiThreadId != ::GetCurrentThreadId())
+    return;
   ResetBackdropObjects();
+}
+
+extern "C" __declspec(dllexport)
+LONG __stdcall WeaselAcrylicAppSdkGetLifetimePolicyVersion() {
+  return 2;
+}
+
+// Call once after the server app/message loop has stopped and before
+// CoUninitialize. Window destruction must NOT call this function.
+extern "C"
+    __declspec(dllexport) HRESULT __stdcall WeaselAcrylicAppSdkShutdownThread(
+        DWORD timeoutMilliseconds) {
+  if (!g_uiThreadId)
+    return S_OK;
+  if (g_uiThreadId != ::GetCurrentThreadId())
+    return RPC_E_WRONG_THREAD;
+  if (g_shutdownInProgress)
+    return HRESULT_FROM_WIN32(ERROR_BUSY);
+
+  g_shutdownInProgress = true;
+  g_runtimeStopping = true;
+  struct ShutdownScope {
+    bool sawQuit = false;
+    int quitCode = 0;
+    ~ShutdownScope() {
+      g_shutdownInProgress = false;
+      if (sawQuit)
+        ::PostQuitMessage(quitCode);
+    }
+  } scope;
+
+  SetDiagnostic(AcrylicDiagnosticStage::kThreadShutdown);
+  try {
+    ResetBackdropObjects();
+
+    if (g_systemDispatcherQueueController != nullptr) {
+      if (g_queueShutdownAction == nullptr) {
+        g_queueShutdownAction =
+            g_systemDispatcherQueueController.ShutdownQueueAsync();
+      }
+
+      // A current-thread queue needs a running message pump to finish.
+      // Blocking on .get() on this STA would risk a deadlock.
+      const ULONGLONG started = ::GetTickCount64();
+      using winrt::Windows::Foundation::AsyncStatus;
+      while (g_queueShutdownAction.Status() == AsyncStatus::Started) {
+        if (::GetTickCount64() - started >= timeoutMilliseconds) {
+          g_lastHresult = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+          // Keep the action, queue and pinned DLL alive on a timeout. Never
+          // claim completion or unload code while callbacks may still exist.
+          return g_lastHresult;
+        }
+
+        MSG message{};
+        // Limit each batch so a busy queue cannot bypass the time limit.
+        for (int i = 0;
+             i < 64 && ::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE);
+             ++i) {
+          if (message.message == WM_QUIT) {
+            scope.sawQuit = true;
+            scope.quitCode = static_cast<int>(message.wParam);
+          } else {
+            ::TranslateMessage(&message);
+            ::DispatchMessageW(&message);
+          }
+        }
+        if (g_queueShutdownAction.Status() == AsyncStatus::Started) {
+          ::MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT,
+                                        MWMO_INPUTAVAILABLE);
+        }
+      }
+      g_queueShutdownAction.GetResults();
+      g_queueShutdownAction = nullptr;
+      g_systemDispatcherQueueController = nullptr;
+    }
+
+    if (g_roInitialized) {
+      ::RoUninitialize();
+      g_roInitialized = false;
+    }
+    SetDiagnostic(AcrylicDiagnosticStage::kThreadShutdownComplete);
+    return S_OK;
+  } catch (winrt::hresult_error const& error) {
+    g_lastHresult = error.code();
+    return g_lastHresult;
+  } catch (...) {
+    g_lastHresult = E_UNEXPECTED;
+    return g_lastHresult;
+  }
 }

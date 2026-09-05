@@ -123,6 +123,20 @@ int WINAPI _tWinMain(HINSTANCE hInstance,
     nRet = -1;
   }
 
+  // B.2b lifecycle policy v2: the app and its candidate HWNDs are gone.
+  // Finish the helper-owned system queue while COM and WTL are still alive.
+  // GetModuleHandle does not load the helper on fallback-only runs.
+  if (HMODULE helper = ::GetModuleHandleW(L"WeaselAcrylicAppSdk.dll")) {
+    using ShutdownThreadFn = HRESULT(WINAPI*)(DWORD);
+    auto shutdownThread = reinterpret_cast<ShutdownThreadFn>(
+        ::GetProcAddress(helper, "WeaselAcrylicAppSdkShutdownThread"));
+    if (shutdownThread && FAILED(shutdownThread(5000))) {
+      ::OutputDebugStringW(
+          L"Weasel Acrylic: UI-thread shutdown did not complete; "
+          L"helper kept loaded until process exit.\n");
+    }
+  }
+
   _Module.Term();
   ::CoUninitialize();
 
