@@ -134,13 +134,21 @@ void SetAcrylicDiagnostic(HWND hwnd, LONG stage, HRESULT hr) {
 // in-process TSF client, GetModuleFileName(nullptr) is WINWORD/Chrome, not
 // Rime.
 HRESULT ReadAcrylicInstallRoot(std::wstring& root) {
-  const DWORD views[] = {RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY};
-  for (DWORD view : views) {
+  // Open each registry view explicitly. The RRF_SUBKEY_WOW64* flags are
+  // not declared when WeaselUI targets Windows 8.1 (_WIN32_WINNT=0x0603).
+  const REGSAM views[] = {KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+  for (REGSAM view : views) {
+    HKEY key = nullptr;
+    const LSTATUS opened =
+        ::RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Rime\\Weasel", 0,
+                        KEY_QUERY_VALUE | view, &key);
+    if (opened != ERROR_SUCCESS)
+      continue;
     WCHAR value[32768] = {};
-    DWORD bytes = sizeof(value);
+    DWORD bytes = static_cast<DWORD>(sizeof(value));
     const LSTATUS result = ::RegGetValueW(
-        HKEY_LOCAL_MACHINE, L"Software\\Rime\\Weasel", L"WeaselRoot",
-        RRF_RT_REG_SZ | view, nullptr, value, &bytes);
+        key, nullptr, L"WeaselRoot", RRF_RT_REG_SZ, nullptr, value, &bytes);
+    ::RegCloseKey(key);
     if (result != ERROR_SUCCESS)
       continue;
     root = value;
