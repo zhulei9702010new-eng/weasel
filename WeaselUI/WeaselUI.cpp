@@ -40,6 +40,7 @@ void UIImpl::Show() {
   if (!panel.IsWindow())
     return;
   panel.ShowWindow(SW_SHOWNA);
+  panel.ShowAcrylicBackdrop();
   shown = true;
   if (timer) {
     KillTimer(panel.m_hWnd, AUTOHIDE_TIMER);
@@ -50,6 +51,7 @@ void UIImpl::Show() {
 void UIImpl::Hide() {
   if (!panel.IsWindow())
     return;
+  panel.HideAcrylicBackdrop();
   panel.ShowWindow(SW_HIDE);
   shown = false;
   if (timer) {
@@ -63,6 +65,7 @@ void UIImpl::ShowWithTimeout(size_t millisec) {
     return;
   DLOG(INFO) << "ShowWithTimeout: " << millisec;
   panel.ShowWindow(SW_SHOWNA);
+  panel.ShowAcrylicBackdrop();
   shown = true;
   SetTimer(panel.m_hWnd, AUTOHIDE_TIMER, static_cast<UINT>(millisec),
            &UIImpl::OnTimer);

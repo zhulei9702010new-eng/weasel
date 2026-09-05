@@ -65,6 +65,8 @@ class WeaselPanel
   void DoPaint(CDCHandle dc);
   bool GetIsReposition() { return m_istorepos; }
   void RedrawWindow();
+  void ShowAcrylicBackdrop();
+  void HideAcrylicBackdrop();
 
   static VOID CALLBACK OnTimer(_In_ HWND hwnd,
                                _In_ UINT uMsg,
@@ -85,6 +87,11 @@ class WeaselPanel
   void _CreateLayout();
   void _ResizeWindow();
   void _RepositionWindow(const bool& adj = false);
+  bool _CreateAcrylicBackdrop();
+  void _DestroyAcrylicBackdrop();
+  void _SyncAcrylicBackdrop();
+  void _UpdateAcrylicBackdropTheme();
+  bool _ShouldShowAcrylicBackdrop() const;
   bool _DrawPreedit(const Text& text, CDCHandle dc, const CRect& rc);
   bool _DrawPreeditBack(const Text& text, CDCHandle dc, const CRect& rc);
   bool _DrawCandidates(CDCHandle& dc, bool back = false);
@@ -149,4 +156,6 @@ class WeaselPanel
   int m_hoverIndex = -1;
   HMONITOR m_hMonitor = NULL;
   bool m_redraw_by_monitor_change = false;
+  HWND m_acrylicBackdrop = NULL;
+  bool m_acrylicBackdropEnabled = false;
 };

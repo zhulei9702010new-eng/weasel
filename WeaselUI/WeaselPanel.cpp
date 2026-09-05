@@ -3,6 +3,7 @@
 
 #include <utility>
 #include <ShellScalingApi.h>
+#include <dwmapi.h>
 #include <VersionHelpers.hpp>
 #include <WeaselIPCData.h>
 #include <algorithm>
@@ -24,6 +25,75 @@
   ((((color & 0xff000000) >> 25) & 0xff) << 24) | (color & 0x00ffffff)
 
 #pragma comment(lib, "Shcore.lib")
+#pragma comment(lib, "Dwmapi.lib")
+
+namespace {
+
+// Numeric values keep the PoC buildable with Weasel's current
+// Windows SDK while DWM evaluates the attributes at runtime.
+constexpr DWORD kDwmaUseImmersiveDarkMode = 20;
+constexpr DWORD kDwmaWindowCornerPreference = 33;
+constexpr DWORD kDwmaBorderColor = 34;
+constexpr DWORD kDwmaSystemBackdropType = 38;
+
+constexpr int kDwmwcpRound = 2;             // DWMWCP_ROUND
+constexpr int kDwmsbtTransientWindow = 3;  // Desktop Acrylic
+constexpr COLORREF kDwmColorNone = 0xFFFFFFFEu;
+constexpr BYTE kAcrylicTintAlpha = 0x18;
+
+constexpr wchar_t kWeaselAcrylicBackdropClass[] =
+    L"WeaselAcrylicBackdropHost";
+
+COLORREF WithAlpha(COLORREF color, BYTE alpha) {
+  return (color & 0x00FFFFFFu) |
+         (static_cast<COLORREF>(alpha) << 24);
+}
+
+bool IsDarkColor(COLORREF color) {
+  const int luminance = GetRValue(color) * 299 +
+                        GetGValue(color) * 587 +
+                        GetBValue(color) * 114;
+  return luminance < 128000;
+}
+
+LRESULT CALLBACK AcrylicBackdropWndProc(HWND hwnd,
+                                        UINT message,
+                                        WPARAM wParam,
+                                        LPARAM lParam) {
+  switch (message) {
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_NCHITTEST:
+      return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:
+      return MA_NOACTIVATE;
+    case WM_NCACTIVATE:
+      return DefWindowProcW(hwnd, WM_NCACTIVATE, TRUE, lParam);
+    case WM_PAINT: {
+      PAINTSTRUCT ps = {};
+      BeginPaint(hwnd, &ps);
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+    default:
+      return DefWindowProcW(hwnd, message, wParam, lParam);
+  }
+}
+
+bool EnsureAcrylicBackdropClass() {
+  WNDCLASSEXW wc = {};
+  wc.cbSize = sizeof(wc);
+  wc.lpfnWndProc = AcrylicBackdropWndProc;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = kWeaselAcrylicBackdropClass;
+
+  if (RegisterClassExW(&wc))
+    return true;
+
+  return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+}  // namespace
 
 template <class t0, class t1, class t2>
 inline void LoadIconNecessary(t0& a, t1& b, t2& c, int d) {
@@ -93,10 +163,130 @@ WeaselPanel::WeaselPanel(weasel::UI& ui)
 }
 
 WeaselPanel::~WeaselPanel() {
+  _DestroyAcrylicBackdrop();
   Gdiplus::GdiplusShutdown(_m_gdiplusToken);
   delete m_layout;
   m_layout = NULL;
   // pDWR.reset();
+}
+
+bool WeaselPanel::_CreateAcrylicBackdrop() {
+  m_acrylicBackdropEnabled = false;
+
+  if (!EnsureAcrylicBackdropClass())
+    return false;
+
+  m_acrylicBackdrop = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+          WS_EX_TRANSPARENT,
+      kWeaselAcrylicBackdropClass, L"", WS_POPUP, 0, 0, 0, 0,
+      ::GetWindow(m_hWnd, GW_OWNER), nullptr, GetModuleHandleW(nullptr),
+      nullptr);
+
+  if (!m_acrylicBackdrop)
+    return false;
+
+  MARGINS margins = {-1, -1, -1, -1};
+  if (FAILED(DwmExtendFrameIntoClientArea(m_acrylicBackdrop, &margins))) {
+    _DestroyAcrylicBackdrop();
+    return false;
+  }
+
+  int backdrop = kDwmsbtTransientWindow;
+  if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop,
+                                   kDwmaSystemBackdropType, &backdrop,
+                                   sizeof(backdrop)))) {
+    _DestroyAcrylicBackdrop();
+    return false;
+  }
+
+  int appliedBackdrop = 0;
+  if (FAILED(DwmGetWindowAttribute(m_acrylicBackdrop,
+                                   kDwmaSystemBackdropType,
+                                   &appliedBackdrop,
+                                   sizeof(appliedBackdrop))) ||
+      appliedBackdrop != kDwmsbtTransientWindow) {
+    _DestroyAcrylicBackdrop();
+    return false;
+  }
+
+  int corner = kDwmwcpRound;
+  DwmSetWindowAttribute(m_acrylicBackdrop,
+                        kDwmaWindowCornerPreference, &corner,
+                        sizeof(corner));
+
+  COLORREF borderColor = kDwmColorNone;
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaBorderColor,
+                        &borderColor, sizeof(borderColor));
+
+  m_acrylicBackdropEnabled = true;
+  _UpdateAcrylicBackdropTheme();
+  return true;
+}
+
+void WeaselPanel::_DestroyAcrylicBackdrop() {
+  m_acrylicBackdropEnabled = false;
+  if (m_acrylicBackdrop) {
+    ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
+    ::DestroyWindow(m_acrylicBackdrop);
+    m_acrylicBackdrop = NULL;
+  }
+}
+
+void WeaselPanel::_UpdateAcrylicBackdropTheme() {
+  if (!m_acrylicBackdrop)
+    return;
+
+  BOOL useDarkMode = IsDarkColor(m_style.back_color) ? TRUE : FALSE;
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseImmersiveDarkMode,
+                        &useDarkMode, sizeof(useDarkMode));
+}
+
+bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
+  if (!m_acrylicBackdropEnabled || !m_acrylicBackdrop || !m_layout ||
+      hide_candidates)
+    return false;
+
+  return ((!m_ctx.empty() && !m_style.inline_preedit) ||
+          (m_style.inline_preedit &&
+           (m_candidateCount || !m_ctx.aux.empty())));
+}
+
+void WeaselPanel::_SyncAcrylicBackdrop() {
+  if (!_ShouldShowAcrylicBackdrop() || !::IsWindowVisible(m_hWnd)) {
+    HideAcrylicBackdrop();
+    return;
+  }
+
+  CRect panelRect;
+  GetWindowRect(&panelRect);
+  CRect contentRect = m_layout->GetContentRect();
+
+  const int x = panelRect.left + contentRect.left;
+  const int y = panelRect.top + contentRect.top;
+  const int width = contentRect.Width();
+  const int height = contentRect.Height();
+
+  if (width <= 0 || height <= 0) {
+    HideAcrylicBackdrop();
+    return;
+  }
+
+  _UpdateAcrylicBackdropTheme();
+
+  // Keep the DWM Acrylic host immediately below the existing layered
+  // Weasel candidate panel.
+  ::SetWindowPos(m_acrylicBackdrop, m_hWnd, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+}
+
+void WeaselPanel::ShowAcrylicBackdrop() {
+  _SyncAcrylicBackdrop();
+}
+
+void WeaselPanel::HideAcrylicBackdrop() {
+  if (m_acrylicBackdrop)
+    ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
 }
 
 void WeaselPanel::_ResizeWindow() {
@@ -1038,7 +1228,14 @@ void WeaselPanel::DoPaint(CDCHandle dc) {
     if ((!m_ctx.empty() && !m_style.inline_preedit) ||
         (m_style.inline_preedit && (m_candidateCount || !m_ctx.aux.empty()))) {
       CRect backrc = m_layout->GetContentRect();
-      _HighlightText(memDC, backrc, m_style.back_color, m_style.shadow_color,
+      COLORREF backColor = m_style.back_color;
+      COLORREF shadowColor = m_style.shadow_color;
+      if (m_acrylicBackdropEnabled) {
+        if (COLORNOTTRANSPARENT(backColor))
+          backColor = WithAlpha(backColor, kAcrylicTintAlpha);
+        shadowColor = TRANS_COLOR;
+      }
+      _HighlightText(memDC, backrc, backColor, shadowColor,
                      DPI_SCALE(m_style.round_corner_ex), BackType::BACKGROUND,
                      IsToRoundStruct(), m_style.border_color);
     }
@@ -1107,10 +1304,13 @@ void WeaselPanel::DoPaint(CDCHandle dc) {
       drawn = true;
     }
     /* Nothing drawn, hide candidate window */
-    if (!drawn)
+    if (!drawn) {
+      HideAcrylicBackdrop();
       ShowWindow(SW_HIDE);
+    }
   }
   _LayerUpdate(rcw, memDC);
+  _SyncAcrylicBackdrop();
 
   // clean objs
   ::DeleteDC(memDC);
@@ -1145,6 +1345,7 @@ LRESULT WeaselPanel::OnCreate(UINT uMsg,
                               BOOL& bHandled) {
   m_mouse_entry = false;
   m_hoverIndex = -1;
+  m_acrylicBackdropEnabled = _CreateAcrylicBackdrop();
   Refresh();
   return TRUE;
 }
@@ -1153,6 +1354,7 @@ LRESULT WeaselPanel::OnDestroy(UINT uMsg,
                                WPARAM wParam,
                                LPARAM lParam,
                                BOOL& bHandled) {
+  _DestroyAcrylicBackdrop();
   m_hoverIndex = -1;
   m_lastMousePos = {-1, -1};
   m_sticky = false;
