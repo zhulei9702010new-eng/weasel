@@ -159,6 +159,25 @@ jobs:
           $ErrorActionPreference = 'Stop'
           output\7z.exe a -t7z "./output/archives/debug_symbols.7z" "output/*.pdb" -r
 
+      - name: Verify Acrylic DLLs in xmake installer
+        if: matrix.variant == 'xmake'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem .\output\archives\weasel*.exe |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw 'xmake installer not found'
+          }
+
+          $listing = (& .\output\7z.exe l $installer.FullName) -join "`n"
+          if ($listing -notmatch 'WeaselAcrylicAppSdk\.dll') {
+            throw 'WeaselAcrylicAppSdk.dll is missing from installer'
+          }
+          if ($listing -notmatch 'Microsoft\.WindowsAppRuntime\.Bootstrap\.dll') {
+            throw 'Microsoft.WindowsAppRuntime.Bootstrap.dll is missing from installer'
+          }
       - name: Upload WinAppSDK Acrylic helper artifact
         if: matrix.variant == 'xmake'
         uses: actions/upload-artifact@v4

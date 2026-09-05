@@ -4,6 +4,7 @@
 #include <utility>
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
+#include <string>
 #include <VersionHelpers.hpp>
 #include <WeaselIPCData.h>
 #include <algorithm>
@@ -91,6 +92,113 @@ bool EnsureAcrylicBackdropClass() {
   return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
+constexpr wchar_t kWeaselAcrylicAppSdkDll[] = L"WeaselAcrylicAppSdk.dll";
+constexpr wchar_t kWeaselAcrylicAppSdkActiveProperty[] =
+    L"WeaselAcrylicAppSdkActive";
+
+class AcrylicAppSdkBridge {
+ public:
+  bool TryInitialize(HWND hwnd, BOOL darkMode) {
+    ShutdownAndUnload();
+
+    if (!Load())
+      return false;
+
+    if (!initialize_(hwnd, darkMode)) {
+      Unload();
+      return false;
+    }
+
+    if (!isActive_()) {
+      shutdown_();
+      Unload();
+      return false;
+    }
+
+    active_ = true;
+    return true;
+  }
+
+  void SetDarkMode(BOOL darkMode) {
+    if (active_ && setDarkMode_)
+      setDarkMode_(darkMode);
+  }
+
+  bool IsActive() const { return active_; }
+
+  void ShutdownAndUnload() {
+    if (active_ && shutdown_)
+      shutdown_();
+
+    active_ = false;
+    Unload();
+  }
+
+ private:
+  using InitializeFn = BOOL(WINAPI*)(HWND, BOOL);
+  using SetDarkModeFn = void(WINAPI*)(BOOL);
+  using IsActiveFn = BOOL(WINAPI*)();
+  using ShutdownFn = void(WINAPI*)();
+
+  bool Load() {
+    WCHAR executablePath[32768] = {};
+    const DWORD length =
+        ::GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
+    if (!length || length >= _countof(executablePath))
+      return false;
+
+    std::wstring helperPath(executablePath, length);
+    const auto slash = helperPath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+      return false;
+
+    helperPath.resize(slash + 1);
+    helperPath += kWeaselAcrylicAppSdkDll;
+
+    module_ = ::LoadLibraryExW(
+        helperPath.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module_)
+      return false;
+
+    initialize_ = reinterpret_cast<InitializeFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkInitialize"));
+    setDarkMode_ = reinterpret_cast<SetDarkModeFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkSetDarkMode"));
+    isActive_ = reinterpret_cast<IsActiveFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkIsActive"));
+    shutdown_ = reinterpret_cast<ShutdownFn>(
+        ::GetProcAddress(module_, "WeaselAcrylicAppSdkShutdown"));
+
+    if (!initialize_ || !setDarkMode_ || !isActive_ || !shutdown_) {
+      Unload();
+      return false;
+    }
+
+    return true;
+  }
+
+  void Unload() {
+    initialize_ = nullptr;
+    setDarkMode_ = nullptr;
+    isActive_ = nullptr;
+    shutdown_ = nullptr;
+
+    if (module_) {
+      ::FreeLibrary(module_);
+      module_ = nullptr;
+    }
+  }
+
+  HMODULE module_ = nullptr;
+  InitializeFn initialize_ = nullptr;
+  SetDarkModeFn setDarkMode_ = nullptr;
+  IsActiveFn isActive_ = nullptr;
+  ShutdownFn shutdown_ = nullptr;
+  bool active_ = false;
+};
+
+AcrylicAppSdkBridge g_acrylicAppSdkBridge;
 }  // namespace
 
 template <class t0, class t1, class t2>
@@ -188,6 +296,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     _DestroyAcrylicBackdrop();
     return false;
   }
+
   BOOL useHostBackdropBrush = TRUE;
   if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseHostBackdropBrush,
                                    &useHostBackdropBrush,
@@ -195,6 +304,30 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     _DestroyAcrylicBackdrop();
     return false;
   }
+
+  int corner = kDwmwcpRound;
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaWindowCornerPreference, &corner,
+                        sizeof(corner));
+
+  COLORREF borderColor = kDwmColorNone;
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaBorderColor, &borderColor,
+                        sizeof(borderColor));
+
+  const BOOL useDarkMode = IsDarkColor(m_style.back_color) ? TRUE : FALSE;
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseImmersiveDarkMode,
+                        &useDarkMode, sizeof(useDarkMode));
+
+  // Stage B.2b: prefer the verified Windows App SDK Desktop Acrylic path.
+  // Weasel itself stays independent from Windows App SDK headers/libraries;
+  // the helper is loaded dynamically beside WeaselServer.exe.
+  if (g_acrylicAppSdkBridge.TryInitialize(m_acrylicBackdrop, useDarkMode)) {
+    ::SetPropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty,
+               reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1)));
+    m_acrylicBackdropEnabled = true;
+    return true;
+  }
+
+  // Fallback: retain the already-verified Stage A/B.1 DWM path.
   int backdrop = kDwmsbtTransientWindow;
   if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaSystemBackdropType,
                                    &backdrop, sizeof(backdrop)))) {
@@ -211,28 +344,23 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     return false;
   }
 
-  int corner = kDwmwcpRound;
-  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaWindowCornerPreference, &corner,
-                        sizeof(corner));
-
-  COLORREF borderColor = kDwmColorNone;
-  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaBorderColor, &borderColor,
-                        sizeof(borderColor));
-
   m_acrylicBackdropEnabled = true;
   _UpdateAcrylicBackdropTheme();
   return true;
 }
-
 void WeaselPanel::_DestroyAcrylicBackdrop() {
   m_acrylicBackdropEnabled = false;
+
+  // Release Composition objects before destroying their target HWND.
+  g_acrylicAppSdkBridge.ShutdownAndUnload();
+
   if (m_acrylicBackdrop) {
+    ::RemovePropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty);
     ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
     ::DestroyWindow(m_acrylicBackdrop);
     m_acrylicBackdrop = NULL;
   }
 }
-
 void WeaselPanel::_UpdateAcrylicBackdropTheme() {
   if (!m_acrylicBackdrop)
     return;
@@ -240,8 +368,10 @@ void WeaselPanel::_UpdateAcrylicBackdropTheme() {
   BOOL useDarkMode = IsDarkColor(m_style.back_color) ? TRUE : FALSE;
   DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseImmersiveDarkMode,
                         &useDarkMode, sizeof(useDarkMode));
-}
 
+  if (g_acrylicAppSdkBridge.IsActive())
+    g_acrylicAppSdkBridge.SetDarkMode(useDarkMode);
+}
 bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
   if (!m_acrylicBackdropEnabled || !m_acrylicBackdrop || !m_layout ||
       hide_candidates)

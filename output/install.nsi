@@ -257,6 +257,8 @@ program_files:
       File "WeaselServer.exe"
       File "rime.dll"
       File "WinSparkle.dll"
+      File /nonfatal "WeaselAcrylicAppSdk.dll"
+      File /nonfatal "Microsoft.WindowsAppRuntime.Bootstrap.dll"
     ${Else}
       File "Win32\WeaselDeployer.exe"
       File "Win32\WeaselServer.exe"
