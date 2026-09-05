@@ -1,17 +1,19 @@
 #include <windows.h>
+#include <dispatcherqueue.h>
 #include <dwmapi.h>
 #include <windows.ui.composition.interop.h>
 
 #include <winrt/base.h>
 #include <winrt/Microsoft.UI.h>
 #include <winrt/Microsoft.UI.Composition.SystemBackdrops.h>
-#include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Interop.h>
+#include <winrt/Windows.System.h>
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
 
 #pragma comment(lib, "Dwmapi.lib")
+#pragma comment(lib, "CoreMessaging.lib")
 #pragma comment(lib, "OneCoreUAP.lib")
 
 namespace {
@@ -41,8 +43,8 @@ void SetDiagnostic(AcrylicDiagnosticStage stage, HRESULT hr = S_OK) {
   g_lastHresult = hr;
 }
 
-winrt::Microsoft::UI::Dispatching::DispatcherQueueController
-    g_dispatcherController{nullptr};
+winrt::Windows::System::DispatcherQueueController
+    g_systemDispatcherQueueController{nullptr};
 winrt::Windows::UI::Composition::Compositor g_compositor{nullptr};
 winrt::Windows::UI::Composition::Desktop::DesktopWindowTarget g_desktopTarget{
     nullptr};
@@ -81,13 +83,13 @@ void ResetBackdropObjects() {
   g_desktopTarget = nullptr;
   g_compositor = nullptr;
 
-  if (g_dispatcherController != nullptr) {
+  if (g_systemDispatcherQueueController != nullptr) {
     try {
-      g_dispatcherController.ShutdownQueue();
+      g_systemDispatcherQueueController.ShutdownQueueAsync();
     } catch (...) {
     }
   }
-  g_dispatcherController = nullptr;
+  g_systemDispatcherQueueController = nullptr;
 }
 
 }  // namespace
@@ -132,11 +134,26 @@ extern "C" __declspec(dllexport) BOOL __stdcall WeaselAcrylicAppSdkInitialize(
     }
 
     SetDiagnostic(AcrylicDiagnosticStage::kDispatcherQueue);
-    auto queue = winrt::Microsoft::UI::Dispatching::DispatcherQueue::
-        GetForCurrentThread();
-    if (queue == nullptr) {
-      g_dispatcherController = winrt::Microsoft::UI::Dispatching::
-          DispatcherQueueController::CreateOnCurrentThread();
+    auto systemQueue =
+        winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
+    if (systemQueue == nullptr) {
+      DispatcherQueueOptions options{
+          sizeof(DispatcherQueueOptions),
+          DQTYPE_THREAD_CURRENT,
+          DQTAT_COM_STA,
+      };
+
+      winrt::Windows::System::DispatcherQueueController controller{nullptr};
+      const HRESULT dispatcherHr = ::CreateDispatcherQueueController(
+          options,
+          reinterpret_cast<ABI::Windows::System::IDispatcherQueueController**>(
+              winrt::put_abi(controller)));
+      if (FAILED(dispatcherHr)) {
+        SetDiagnostic(AcrylicDiagnosticStage::kDispatcherQueue, dispatcherHr);
+        return FALSE;
+      }
+
+      g_systemDispatcherQueueController = controller;
     }
 
     SetDiagnostic(AcrylicDiagnosticStage::kCompositor);
