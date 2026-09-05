@@ -17,6 +17,30 @@
 namespace {
 
 constexpr DWORD kDwmaUseHostBackdropBrush = 17;
+
+enum class AcrylicDiagnosticStage : LONG {
+  kNone = 0,
+  kEnteredInitialize = 1,
+  kIsSupported = 10,
+  kHostBackdropBrush = 20,
+  kDispatcherQueue = 30,
+  kCompositor = 40,
+  kDesktopWindowTarget = 50,
+  kRootVisual = 60,
+  kBackdropConfiguration = 70,
+  kAcrylicController = 80,
+  kSetTarget = 90,
+  kComplete = 100,
+};
+
+LONG g_lastStage = static_cast<LONG>(AcrylicDiagnosticStage::kNone);
+HRESULT g_lastHresult = S_OK;
+
+void SetDiagnostic(AcrylicDiagnosticStage stage, HRESULT hr = S_OK) {
+  g_lastStage = static_cast<LONG>(stage);
+  g_lastHresult = hr;
+}
+
 winrt::Microsoft::UI::Dispatching::DispatcherQueueController
     g_dispatcherController{nullptr};
 winrt::Windows::UI::Composition::Compositor g_compositor{nullptr};
@@ -68,25 +92,46 @@ void ResetBackdropObjects() {
 
 }  // namespace
 
+extern "C"
+    __declspec(dllexport) LONG __stdcall WeaselAcrylicAppSdkGetLastStage() {
+  return g_lastStage;
+}
+
+extern "C"
+    __declspec(dllexport) LONG __stdcall WeaselAcrylicAppSdkGetLastHresult() {
+  return static_cast<LONG>(g_lastHresult);
+}
+
 extern "C" __declspec(dllexport) BOOL __stdcall WeaselAcrylicAppSdkInitialize(
     HWND hwnd,
     BOOL darkMode) {
-  try {
-    if (hwnd == nullptr)
-      return FALSE;
+  SetDiagnostic(AcrylicDiagnosticStage::kEnteredInitialize);
 
+  try {
+    if (hwnd == nullptr) {
+      SetDiagnostic(AcrylicDiagnosticStage::kEnteredInitialize, E_INVALIDARG);
+      return FALSE;
+    }
+
+    SetDiagnostic(AcrylicDiagnosticStage::kIsSupported);
     if (!winrt::Microsoft::UI::Composition::SystemBackdrops::
             DesktopAcrylicController::IsSupported()) {
+      SetDiagnostic(AcrylicDiagnosticStage::kIsSupported,
+                    HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
       return FALSE;
     }
 
+    SetDiagnostic(AcrylicDiagnosticStage::kHostBackdropBrush);
     BOOL useHostBackdropBrush = TRUE;
-    if (FAILED(DwmSetWindowAttribute(hwnd, kDwmaUseHostBackdropBrush,
-                                     &useHostBackdropBrush,
-                                     sizeof(useHostBackdropBrush)))) {
+    const HRESULT hostBackdropHr = DwmSetWindowAttribute(
+        hwnd, kDwmaUseHostBackdropBrush, &useHostBackdropBrush,
+        sizeof(useHostBackdropBrush));
+    if (FAILED(hostBackdropHr)) {
+      SetDiagnostic(AcrylicDiagnosticStage::kHostBackdropBrush, hostBackdropHr);
       return FALSE;
     }
 
+    SetDiagnostic(AcrylicDiagnosticStage::kDispatcherQueue);
     auto queue = winrt::Microsoft::UI::Dispatching::DispatcherQueue::
         GetForCurrentThread();
     if (queue == nullptr) {
@@ -94,13 +139,18 @@ extern "C" __declspec(dllexport) BOOL __stdcall WeaselAcrylicAppSdkInitialize(
           DispatcherQueueController::CreateOnCurrentThread();
     }
 
+    SetDiagnostic(AcrylicDiagnosticStage::kCompositor);
     g_compositor = winrt::Windows::UI::Composition::Compositor();
+
+    SetDiagnostic(AcrylicDiagnosticStage::kDesktopWindowTarget);
     g_desktopTarget = CreateDesktopWindowTarget(hwnd, g_compositor);
 
+    SetDiagnostic(AcrylicDiagnosticStage::kRootVisual);
     g_rootVisual = g_compositor.CreateContainerVisual();
     g_rootVisual.RelativeSizeAdjustment({1.0f, 1.0f});
     g_desktopTarget.Root(g_rootVisual);
 
+    SetDiagnostic(AcrylicDiagnosticStage::kBackdropConfiguration);
     g_backdropConfiguration = winrt::Microsoft::UI::Composition::
         SystemBackdrops::SystemBackdropConfiguration();
     g_backdropConfiguration.IsInputActive(true);
@@ -110,20 +160,29 @@ extern "C" __declspec(dllexport) BOOL __stdcall WeaselAcrylicAppSdkInitialize(
                  : winrt::Microsoft::UI::Composition::SystemBackdrops::
                        SystemBackdropTheme::Light);
 
+    SetDiagnostic(AcrylicDiagnosticStage::kAcrylicController);
     g_acrylicController = winrt::Microsoft::UI::Composition::SystemBackdrops::
         DesktopAcrylicController();
     g_acrylicController.Kind(winrt::Microsoft::UI::Composition::
                                  SystemBackdrops::DesktopAcrylicKind::Base);
     g_acrylicController.SetSystemBackdropConfiguration(g_backdropConfiguration);
 
+    SetDiagnostic(AcrylicDiagnosticStage::kSetTarget);
     auto windowId = winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd);
     if (!g_acrylicController.SetTarget(windowId, g_desktopTarget)) {
+      SetDiagnostic(AcrylicDiagnosticStage::kSetTarget, E_FAIL);
       ResetBackdropObjects();
       return FALSE;
     }
 
+    SetDiagnostic(AcrylicDiagnosticStage::kComplete);
     return TRUE;
+  } catch (winrt::hresult_error const& error) {
+    g_lastHresult = error.code();
+    ResetBackdropObjects();
+    return FALSE;
   } catch (...) {
+    g_lastHresult = E_UNEXPECTED;
     ResetBackdropObjects();
     return FALSE;
   }
