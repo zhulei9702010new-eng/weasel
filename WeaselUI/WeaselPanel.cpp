@@ -31,6 +31,7 @@ namespace {
 
 // Numeric values keep the PoC buildable with Weasel's current
 // Windows SDK while DWM evaluates the attributes at runtime.
+constexpr DWORD kDwmaUseHostBackdropBrush = 17;
 constexpr DWORD kDwmaUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmaWindowCornerPreference = 33;
 constexpr DWORD kDwmaBorderColor = 34;
@@ -187,7 +188,13 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     _DestroyAcrylicBackdrop();
     return false;
   }
-
+  BOOL useHostBackdropBrush = TRUE;
+  if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseHostBackdropBrush,
+                                   &useHostBackdropBrush,
+                                   sizeof(useHostBackdropBrush)))) {
+    _DestroyAcrylicBackdrop();
+    return false;
+  }
   int backdrop = kDwmsbtTransientWindow;
   if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaSystemBackdropType,
                                    &backdrop, sizeof(backdrop)))) {
