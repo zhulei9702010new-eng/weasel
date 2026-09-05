@@ -36,23 +36,20 @@ constexpr DWORD kDwmaWindowCornerPreference = 33;
 constexpr DWORD kDwmaBorderColor = 34;
 constexpr DWORD kDwmaSystemBackdropType = 38;
 
-constexpr int kDwmwcpRound = 2;             // DWMWCP_ROUND
+constexpr int kDwmwcpRound = 2;            // DWMWCP_ROUND
 constexpr int kDwmsbtTransientWindow = 3;  // Desktop Acrylic
 constexpr COLORREF kDwmColorNone = 0xFFFFFFFEu;
 constexpr BYTE kAcrylicTintAlpha = 0x18;
 
-constexpr wchar_t kWeaselAcrylicBackdropClass[] =
-    L"WeaselAcrylicBackdropHost";
+constexpr wchar_t kWeaselAcrylicBackdropClass[] = L"WeaselAcrylicBackdropHost";
 
 COLORREF WithAlpha(COLORREF color, BYTE alpha) {
-  return (color & 0x00FFFFFFu) |
-         (static_cast<COLORREF>(alpha) << 24);
+  return (color & 0x00FFFFFFu) | (static_cast<COLORREF>(alpha) << 24);
 }
 
 bool IsDarkColor(COLORREF color) {
-  const int luminance = GetRValue(color) * 299 +
-                        GetGValue(color) * 587 +
-                        GetBValue(color) * 114;
+  const int luminance =
+      GetRValue(color) * 299 + GetGValue(color) * 587 + GetBValue(color) * 114;
   return luminance < 128000;
 }
 
@@ -177,8 +174,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     return false;
 
   m_acrylicBackdrop = CreateWindowExW(
-      WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-          WS_EX_TRANSPARENT,
+      WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
       kWeaselAcrylicBackdropClass, L"", WS_POPUP, 0, 0, 0, 0,
       ::GetWindow(m_hWnd, GW_OWNER), nullptr, GetModuleHandleW(nullptr),
       nullptr);
@@ -193,16 +189,14 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   }
 
   int backdrop = kDwmsbtTransientWindow;
-  if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop,
-                                   kDwmaSystemBackdropType, &backdrop,
-                                   sizeof(backdrop)))) {
+  if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaSystemBackdropType,
+                                   &backdrop, sizeof(backdrop)))) {
     _DestroyAcrylicBackdrop();
     return false;
   }
 
   int appliedBackdrop = 0;
-  if (FAILED(DwmGetWindowAttribute(m_acrylicBackdrop,
-                                   kDwmaSystemBackdropType,
+  if (FAILED(DwmGetWindowAttribute(m_acrylicBackdrop, kDwmaSystemBackdropType,
                                    &appliedBackdrop,
                                    sizeof(appliedBackdrop))) ||
       appliedBackdrop != kDwmsbtTransientWindow) {
@@ -211,13 +205,12 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   }
 
   int corner = kDwmwcpRound;
-  DwmSetWindowAttribute(m_acrylicBackdrop,
-                        kDwmaWindowCornerPreference, &corner,
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaWindowCornerPreference, &corner,
                         sizeof(corner));
 
   COLORREF borderColor = kDwmColorNone;
-  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaBorderColor,
-                        &borderColor, sizeof(borderColor));
+  DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaBorderColor, &borderColor,
+                        sizeof(borderColor));
 
   m_acrylicBackdropEnabled = true;
   _UpdateAcrylicBackdropTheme();
@@ -248,8 +241,7 @@ bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
     return false;
 
   return ((!m_ctx.empty() && !m_style.inline_preedit) ||
-          (m_style.inline_preedit &&
-           (m_candidateCount || !m_ctx.aux.empty())));
+          (m_style.inline_preedit && (m_candidateCount || !m_ctx.aux.empty())));
 }
 
 void WeaselPanel::_SyncAcrylicBackdrop() {
