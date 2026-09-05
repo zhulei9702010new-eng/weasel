@@ -152,6 +152,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           output\7z.exe a -t7z "./output/archives/debug_symbols.7z" "output/*.pdb" -r
 
+      - name: Upload xmake installer artifact
+        if: matrix.variant == 'xmake'
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-xmake-acrylic-${{ env.git_ref_name }}
+          if-no-files-found: error
+          path: |
+            .\output\archives\weasel*.exe
       - name: Upload artifacts
         if: matrix.variant == 'msbuild'
         uses: actions/upload-artifact@v4
