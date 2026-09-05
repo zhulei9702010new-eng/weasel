@@ -132,6 +132,12 @@ jobs:
         if: matrix.variant == 'xmake'
         uses: xmake-io/github-action-setup-xmake@v1
 
+      - name: Build Windows App SDK Acrylic helper
+        if: matrix.variant == 'xmake'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /restore /m /p:Configuration=Release /p:Platform=x64
       - name: Build Weasel
         shell: pwsh
         id: build_weasel
@@ -152,6 +158,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           output\7z.exe a -t7z "./output/archives/debug_symbols.7z" "output/*.pdb" -r
 
+      - name: Upload WinAppSDK Acrylic helper artifact
+        if: matrix.variant == 'xmake'
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-acrylic-appsdk-helper-${{ env.git_ref_name }}
+          if-no-files-found: error
+          path: |
+            .\output\WeaselAcrylicAppSdk.dll
       - name: Upload xmake installer artifact
         if: matrix.variant == 'xmake'
         uses: actions/upload-artifact@v4
