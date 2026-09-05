@@ -167,6 +167,8 @@ jobs:
           if-no-files-found: error
           path: |
             .\output\WeaselAcrylicAppSdk.dll
+            .\output\Microsoft.WindowsAppRuntime.Bootstrap.dll
+
       - name: Upload xmake installer artifact
         if: matrix.variant == 'xmake'
         uses: actions/upload-artifact@v4
