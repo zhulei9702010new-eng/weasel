@@ -137,7 +137,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /restore /m /p:Configuration=Release /p:Platform=x64
+          msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /t:Restore /p:Configuration=Release /p:Platform=x64
+          msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /m /p:Configuration=Release /p:Platform=x64
       - name: Build Weasel
         shell: pwsh
         id: build_weasel
