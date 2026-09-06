@@ -38,10 +38,8 @@ constexpr DWORD kDwmaUseHostBackdropBrush = 17;
 constexpr DWORD kDwmaUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmaWindowCornerPreference = 33;
 constexpr DWORD kDwmaBorderColor = 34;
-constexpr DWORD kDwmaSystemBackdropType = 38;
 
-constexpr int kDwmwcpRound = 2;            // DWMWCP_ROUND
-constexpr int kDwmsbtTransientWindow = 3;  // Desktop Acrylic
+constexpr int kDwmwcpRound = 2;  // DWMWCP_ROUND
 constexpr COLORREF kDwmColorNone = 0xFFFFFFFEu;
 constexpr BYTE kAcrylicTintAlpha = 0x18;
 
@@ -446,7 +444,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
 
   // B.2c: both server and TSF client HWNDs use the installed optional helper.
   // The helper resolves the runtime explicitly and owns targets per UI thread.
-  // A failure keeps the existing DWM fallback and records Stage/HRESULT.
+  // Failure restores the skin and retains diagnostics on a hidden host.
   if (g_acrylicAppSdkBridge.TryInitialize(m_acrylicBackdrop, useDarkMode,
                                           m_in_server)) {
     ::SetPropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty,
@@ -455,26 +453,14 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     return true;
   }
 
-  // Fallback: retain the already-verified Stage A/B.1 DWM path.
-  int backdrop = kDwmsbtTransientWindow;
-  if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaSystemBackdropType,
-                                   &backdrop, sizeof(backdrop)))) {
-    _DestroyAcrylicBackdrop();
-    return false;
-  }
-
-  int appliedBackdrop = 0;
-  if (FAILED(DwmGetWindowAttribute(m_acrylicBackdrop, kDwmaSystemBackdropType,
-                                   &appliedBackdrop,
-                                   sizeof(appliedBackdrop))) ||
-      appliedBackdrop != kDwmsbtTransientWindow) {
-    _DestroyAcrylicBackdrop();
-    return false;
-  }
-
-  m_acrylicBackdropEnabled = true;
-  _UpdateAcrylicBackdropTheme();
-  return true;
+  // No system-drawn fallback: use the configured skin instead.
+  // Leaving m_acrylicBackdropEnabled false preserves the original
+  // background alpha, border and shadow in DoPaint.
+  // Keep the failed host hidden for Stage/HRESULT inspection; normal
+  // window destruction will release it without changing the UI queue.
+  g_acrylicAppSdkBridge.DetachWindow(m_acrylicBackdrop);
+  ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
+  return false;
 }
 void WeaselPanel::_DestroyAcrylicBackdrop() {
   m_acrylicBackdropEnabled = false;
