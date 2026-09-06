@@ -501,8 +501,9 @@ void CCandidateList::_MakeUIWindow() {
 }
 
 bool CCandidateList::_IsSettingsHost() const {
-  // Limit this first correction to the one reported host. Do not alter the
-  // positioning of Word, WXWork, MailClient or other working clients.
+  // R3: keep the existing Settings anchor policy and also enable it for the
+  // installed Microsoft Store. The legacy member/function names are retained
+  // to avoid changing the candidate object's ABI. No new positioning algorithm.
   wchar_t path[32768] = {};
   wchar_t windows[32768] = {};
   const DWORD length = ::GetModuleFileNameW(nullptr, path, _countof(path));
@@ -512,9 +513,31 @@ bool CCandidateList::_IsSettingsHost() const {
     return false;
   const std::wstring expected = std::wstring(windows, count) +
                                 L"\\ImmersiveControlPanel\\SystemSettings.exe";
-  return ::CompareStringOrdinal(
-             path, static_cast<int>(length), expected.c_str(),
-             static_cast<int>(expected.size()), TRUE) == CSTR_EQUAL;
+  if (::CompareStringOrdinal(path, static_cast<int>(length), expected.c_str(),
+                             static_cast<int>(expected.size()),
+                             TRUE) == CSTR_EQUAL)
+    return true;
+
+  wchar_t family[256] = {};
+  UINT32 capacity = _countof(family);
+  if (::GetPackageFamilyName(::GetCurrentProcess(), &capacity, family) !=
+          ERROR_SUCCESS ||
+      ::lstrcmpW(family, L"Microsoft.WindowsStore_8wekyb3d8bbwe") != 0)
+    return false;
+  wchar_t package[256] = {};
+  capacity = _countof(package);
+  if (::GetPackageFullName(::GetCurrentProcess(), &capacity, package) !=
+      ERROR_SUCCESS)
+    return false;
+  wchar_t directory[32768] = {};
+  capacity = _countof(directory);
+  if (::GetPackagePathByFullName(package, &capacity, directory) !=
+      ERROR_SUCCESS)
+    return false;
+  const std::wstring store = std::wstring(directory) + L"\\WinStore.App.exe";
+  return ::CompareStringOrdinal(path, static_cast<int>(length), store.c_str(),
+                                static_cast<int>(store.size()),
+                                TRUE) == CSTR_EQUAL;
 }
 
 bool CCandidateList::_ReadOwnerGeometry(
@@ -552,6 +575,7 @@ void CCandidateList::_PublishOwnerFollowDiagnostics() {
                reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(value)));
   };
   publish(L"WeaselOwnerFollowPolicy", 1);
+  publish(L"WeaselOwnerFollowScope", 2);  // Settings + installed Store (R3).
   publish(L"WeaselOwnerSourceUpdates", _followSourceUpdates);
   publish(L"WeaselOwnerTranslations", _followTranslations);
   publish(L"WeaselOwnerRepeatedSources", _followRepeatedSources);

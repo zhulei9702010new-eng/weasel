@@ -588,6 +588,12 @@ struct ExternalAcrylicState {
   DWORD pendingSince = 0;
   DWORD pendingSequence = 0;
   DWORD boundServerPid = 0;  // Derived locally from the connected input pipe.
+  // R3 Search-only presentation guard; not a pixel-level blur detector.
+  bool searchPresentation = false;
+  bool presentationTiming = false;
+  bool presentationRepairUsed = false;
+  bool presentationBlocked = false;  // Client: retry only after hide/recreate.
+  DWORD presentationSince = 0;
 };
 
 ULONG_PTR ExternalProperty(HWND hwnd, const wchar_t* name) {
@@ -639,6 +645,24 @@ constexpr wchar_t kExtPostError[] = L"WeaselAcrylicExternalPostError";
 constexpr wchar_t kExtCreateStage[] = L"WeaselAcrylicCreateStage";
 constexpr wchar_t kExtCreateHr[] = L"WeaselAcrylicCreateHresult";
 constexpr wchar_t kExtPlacementError[] = L"WeaselAcrylicExternalPlacementError";
+constexpr wchar_t kExtPresentationPolicy[] = L"WeaselAcrylicPresentationPolicy";
+constexpr wchar_t kExtPresentationReady[] = L"WeaselAcrylicPresentationReady";
+constexpr wchar_t kExtPresentationStage[] = L"WeaselAcrylicPresentationStage";
+constexpr wchar_t kExtPresentationBlocker[] =
+    L"WeaselAcrylicPresentationBlocker";
+constexpr wchar_t kExtPresentationRepairs[] =
+    L"WeaselAcrylicPresentationRepairs";
+constexpr wchar_t kExtPresentationFailClient[] =
+    L"WeaselAcrylicPresentationFailClient";
+constexpr wchar_t kExtPresentationFailToken[] =
+    L"WeaselAcrylicPresentationFailToken";
+constexpr wchar_t kExtPresentationBlocked[] =
+    L"WeaselAcrylicPresentationBlocked";
+constexpr wchar_t kExtPresentationClientStage[] =
+    L"WeaselAcrylicPresentationClientStage";
+constexpr wchar_t kExtPresentationClientBlocker[] =
+    L"WeaselAcrylicPresentationClientBlocker";
+constexpr DWORD kPresentationSettleMs = 100;
 
 bool ExternalPathEquals(const std::wstring& left, const std::wstring& right) {
   return ::CompareStringOrdinal(left.c_str(), static_cast<int>(left.size()),
@@ -1031,6 +1055,7 @@ void PrepareExternalServer(HWND hwnd) {
     return;
   PrepareExternalLowMessages(hwnd);
   SetExternalProperty(hwnd, kExtCompatibility, 1);
+  SetExternalProperty(hwnd, kExtPresentationPolicy, 1);
   if (!SetExternalProperty(hwnd, kExtProtocol, kExternalProtocol) ||
       !SetExternalProperty(hwnd, kExtServer, 1)) {
     ::RemovePropW(hwnd, kExtProtocol);
@@ -1054,6 +1079,7 @@ void EndExternalServerLease(HWND hwnd, ExternalAcrylicState* state) {
   state->candidate = nullptr;
   ::KillTimer(hwnd, kExternalTimer);
   ::RemovePropW(hwnd, kExtActive);
+  ::RemovePropW(hwnd, kExtPresentationReady);
   ::RemovePropW(hwnd, kExtOwner);
   ::RemovePropW(hwnd, kExtAckClient);
   ::RemovePropW(hwnd, kExtAckToken);
@@ -1085,6 +1111,115 @@ bool ReadExternalSnapshot(HWND client, DWORD token, ExternalSnapshot& snap) {
          ExternalProperty(client, kExtToken) == token &&
          ExternalProperty(client, kExtWanted) == 1 && snap.width > 0 &&
          snap.height > 0 && snap.width <= 32768 && snap.height <= 32768;
+}
+
+// Verify the acknowledged rectangle and the currently observable Z-order.
+// Hidden windows and non-overlapping windows do not obstruct the material.
+// In particular, the server's hidden candidate may legitimately be between the
+// foreground and background. IsWindowVisible alone is NOT this check.
+DWORD CheckSearchPresentation(HWND host,
+                              const ExternalSnapshot& snap,
+                              HWND& blocker) {
+  blocker = nullptr;
+  if (!ExternalCandidateVisible(snap.candidate) || !::IsWindowVisible(host))
+    return 10;
+  RECT rect = {};
+  if (!::GetWindowRect(host, &rect) || rect.left != snap.x ||
+      rect.top != snap.y ||
+      static_cast<LONGLONG>(rect.right) - rect.left != snap.width ||
+      static_cast<LONGLONG>(rect.bottom) - rect.top != snap.height)
+    return 20;
+  DWORD cloaked = 0;
+  if (FAILED(::DwmGetWindowAttribute(host, DWMWA_CLOAKED, &cloaked,
+                                     sizeof(cloaked))) ||
+      cloaked)
+    return 30;
+  HWND current = host;
+  // Bound the walk because foreign windows can be destroyed/reordered during
+  // it. This is conservative structural validation, never a blur certificate.
+  for (unsigned i = 0; i < 512; ++i) {
+    const HWND previous = ::GetWindow(current, GW_HWNDPREV);
+    if (!previous || previous == current)
+      return 50;
+    if (previous == snap.candidate)
+      return 100;
+    current = previous;
+    if (!::IsWindowVisible(current))
+      continue;
+    DWORD hidden = 0;
+    if (SUCCEEDED(::DwmGetWindowAttribute(current, DWMWA_CLOAKED, &hidden,
+                                          sizeof(hidden))) &&
+        hidden)
+      continue;
+    RECT other = {};
+    if (!::GetWindowRect(current, &other))
+      return 60;
+    if (other.left < rect.right && other.right > rect.left &&
+        other.top < rect.bottom && other.bottom > rect.top) {
+      blocker = current;
+      return 40;
+    }
+  }
+  return 70;
+}
+
+bool SearchProcessForPresentation(DWORD pid) {
+  HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process)
+    return false;
+  const bool search =
+      ExternalKindForProcess(process) == ExternalClientKind::Search;
+  ::CloseHandle(process);
+  return search;
+}
+
+// Run only from the server's existing 100 ms lease timer. No new timer, IPC
+// wait, foreground activation, foreign HWND move, or window-band mutation.
+void RefreshSearchPresentation(HWND hwnd, ExternalAcrylicState* state) {
+  if (!state || !state->server || !state->active || !state->searchPresentation)
+    return;
+  HWND blocker = nullptr;
+  const DWORD stage = CheckSearchPresentation(hwnd, state->snapshot, blocker);
+  SetExternalProperty(hwnd, kExtPresentationStage, stage);
+  SetExternalProperty(hwnd, kExtPresentationBlocker,
+                      reinterpret_cast<ULONG_PTR>(blocker));
+  if (stage == 100) {
+    if (!state->presentationTiming) {
+      state->presentationSince = ::GetTickCount();
+      state->presentationTiming = true;
+    }
+    if (static_cast<DWORD>(::GetTickCount() - state->presentationSince) <
+        kPresentationSettleMs) {
+      SetExternalProperty(hwnd, kExtPresentationStage, 2);  // Settling.
+      return;
+    }
+    if (ExternalProperty(hwnd, kExtPresentationReady) != 1 &&
+        SetExternalProperty(hwnd, kExtPresentationReady, 1))
+      ::PostMessageW(state->peer, kExternalAck, reinterpret_cast<WPARAM>(hwnd),
+                     state->token);
+    return;
+  }
+  SetExternalProperty(hwnd, kExtPresentationReady, 0);
+  state->presentationTiming = false;
+  if (!state->presentationRepairUsed) {
+    state->presentationRepairUsed = true;
+    SetExternalProperty(hwnd, kExtPresentationRepairs, 1);
+    const auto& snap = state->snapshot;
+    ::SetLastError(ERROR_SUCCESS);
+    const BOOL repaired = ::SetWindowPos(
+        hwnd, snap.candidate, snap.x, snap.y, snap.width, snap.height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+    const DWORD repairError = repaired ? ERROR_SUCCESS : ::GetLastError();
+    if (ExternalState(hwnd) != state || repaired)
+      return;  // Re-check after another timer tick, not in the same call.
+    SetExternalProperty(hwnd, kExtPlacementError, repairError);
+  }
+  // One unsuccessful repair ends this lease. The matching client records a
+  // sticky block until hide/recreate, avoiding an input-driven retry storm.
+  SetExternalProperty(hwnd, kExtPresentationFailClient,
+                      reinterpret_cast<ULONG_PTR>(state->peer));
+  SetExternalProperty(hwnd, kExtPresentationFailToken, state->token);
+  EndExternalServerLease(hwnd, state);
 }
 
 void ApplyExternalSnapshot(HWND hwnd,
@@ -1127,6 +1262,15 @@ void ApplyExternalSnapshot(HWND hwnd,
     state->peer = client;
     state->candidate = snap.candidate;
     state->token = token;
+    state->searchPresentation =
+        compatibilityClient && SearchProcessForPresentation(clientPid);
+    state->presentationTiming = false;
+    state->presentationRepairUsed = false;
+    SetExternalProperty(hwnd, kExtPresentationReady, 0);
+    SetExternalProperty(hwnd, kExtPresentationStage, 1);
+    SetExternalProperty(hwnd, kExtPresentationRepairs, 0);
+    SetExternalProperty(hwnd, kExtPresentationFailClient, 0);
+    SetExternalProperty(hwnd, kExtPresentationFailToken, 0);
     if (!::SetTimer(hwnd, kExternalTimer, 100, nullptr)) {
       EndExternalServerLease(hwnd, state);
       return;
@@ -1149,7 +1293,8 @@ void ApplyExternalSnapshot(HWND hwnd,
        placed.top == snap.y &&
        static_cast<LONGLONG>(placed.right) - placed.left == snap.width &&
        static_cast<LONGLONG>(placed.bottom) - placed.top == snap.height &&
-       ::GetWindow(snap.candidate, GW_HWNDNEXT) == hwnd);
+       (state->searchPresentation ||
+        ::GetWindow(snap.candidate, GW_HWNDNEXT) == hwnd));
   SetExternalProperty(
       hwnd, kExtPlacementError,
       placementVerified && positioned
@@ -1168,11 +1313,30 @@ void ApplyExternalSnapshot(HWND hwnd,
     return;
   }
   state->snapshot = snap;
+  if (state->searchPresentation) {
+    state->presentationTiming = false;
+    SetExternalProperty(hwnd, kExtPresentationReady, 0);
+    SetExternalProperty(hwnd, kExtPresentationStage, 1);
+    return;  // Search ACK is delayed until two stable presentation samples.
+  }
   ::PostMessageW(client, kExternalAck, reinterpret_cast<WPARAM>(hwnd), token);
 }
 
 bool ExternalLeaseReady(HWND client, const ExternalAcrylicState* state) {
   const HWND host = state ? state->peer : nullptr;
+  if (state && state->searchPresentation) {
+    HWND blocker = nullptr;
+    const DWORD stage =
+        host ? CheckSearchPresentation(host, state->snapshot, blocker) : 0;
+    SetExternalProperty(client, kExtPresentationClientStage, stage);
+    SetExternalProperty(client, kExtPresentationClientBlocker,
+                        reinterpret_cast<ULONG_PTR>(blocker));
+    if (!host || ExternalProperty(host, kExtPresentationPolicy) != 1 ||
+        ExternalProperty(host, kExtPresentationReady) != 1 ||
+        ExternalProperty(host, kExtAckSequence) != state->snapshot.sequence ||
+        stage != 100)
+      return false;
+  }
   return state && !state->server && state->active && host &&
          ExternalServerAvailable(host) && ::IsWindowVisible(host) &&
          ExternalProperty(host, kExtActive) == 1 &&
@@ -1230,6 +1394,8 @@ void ReleaseExternalClient(HWND hwnd) {
   state->peer = nullptr;
   state->token = 0;
   state->boundServerPid = 0;
+  state->presentationBlocked = false;
+  SetExternalProperty(hwnd, kExtPresentationBlocked, 0);
   SetExternalProperty(hwnd, kExtBoundPid, 0);
 }
 
@@ -1295,7 +1461,7 @@ bool ExternalPipePeerCurrent(HWND hwnd, ExternalAcrylicState* state) {
 }
 
 void RequestExternalSnapshot(HWND hwnd, ExternalAcrylicState* state) {
-  if (!state || state->server || !state->active)
+  if (!state || state->server || !state->active || state->presentationBlocked)
     return;
   const DWORD now = ::GetTickCount();
   if (state->peer)
@@ -1374,6 +1540,8 @@ void SyncExternalClient(HWND hwnd,
     return;
   state->candidate = candidate;
   state->panel = panel;
+  state->searchPresentation =
+      CurrentExternalKind() == ExternalClientKind::Search;
   if (CurrentExternalKind() != ExternalClientKind::Settings) {
     SetExternalProperty(hwnd, kExtCompatibility, 1);
     SetExternalProperty(hwnd, kExtClientKind,
@@ -1456,6 +1624,14 @@ bool HandleExternalAcrylicMessage(HWND hwnd,
         state->token == static_cast<DWORD>(lParam)) {
       state->pending = false;
       if (!ExternalLeaseReady(hwnd, state)) {
+        if (state->searchPresentation &&
+            ExternalProperty(state->peer, kExtPresentationFailClient) ==
+                reinterpret_cast<ULONG_PTR>(hwnd) &&
+            ExternalProperty(state->peer, kExtPresentationFailToken) ==
+                state->token) {
+          state->presentationBlocked = true;
+          SetExternalProperty(hwnd, kExtPresentationBlocked, 1);
+        }
         // A negative ACK must not create an immediate retry/ACK busy loop.
         state->peer = nullptr;
         state->lastAttempt = ::GetTickCount();
@@ -1484,6 +1660,7 @@ bool HandleExternalAcrylicMessage(HWND hwnd,
       } else {
         // Liveness only. Geometry still comes exclusively from panel snapshots.
         SetExternalProperty(hwnd, kExtServerPulse, ::GetTickCount());
+        RefreshSearchPresentation(hwnd, state);
       }
     }
   } else if (state->active) {
