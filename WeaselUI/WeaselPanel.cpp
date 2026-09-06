@@ -4,6 +4,7 @@
 #include <utility>
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
+#include <commctrl.h>
 #include <string>
 #include <atomic>
 #include <new>
@@ -30,6 +31,7 @@
 #pragma comment(lib, "Shcore.lib")
 #pragma comment(lib, "Dwmapi.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Comctl32.lib")
 
 namespace {
 
@@ -45,6 +47,178 @@ constexpr COLORREF kDwmColorNone = 0xFFFFFFFEu;
 constexpr BYTE kAcrylicTintAlpha = 0x18;
 
 constexpr wchar_t kWeaselAcrylicBackdropClass[] = L"WeaselAcrylicBackdropHost";
+
+// CI #22: follow the real candidate HWND, including position changes made by
+// the host application rather than MoveTo(). Install only for local Acrylic;
+// the CI #21 Settings protocol and its hidden client host are unchanged.
+constexpr wchar_t kLocalAcrylicGeometryProperty[] =
+    L"WeaselAcrylicLocalGeometryState";
+constexpr wchar_t kLocalAcrylicGeometryPolicy[] =
+    L"WeaselAcrylicGeometryPolicy";
+constexpr UINT_PTR kLocalAcrylicGeometrySubclass = 0x57414731;
+
+struct LocalAcrylicGeometryState {
+  HWND candidate = nullptr;
+  WeaselPanel* panel = nullptr;
+  unsigned references = 1;  // Owned by the subclass, on this UI thread only.
+  unsigned depth = 0;
+  bool installed = false;
+  bool pending = false;
+  bool syncing = false;
+};
+
+LocalAcrylicGeometryState* LocalAcrylicGeometry(HWND hwnd) {
+  return hwnd ? reinterpret_cast<LocalAcrylicGeometryState*>(
+                    ::GetPropW(hwnd, kLocalAcrylicGeometryProperty))
+              : nullptr;
+}
+
+void ReleaseLocalAcrylicGeometry(LocalAcrylicGeometryState* state) {
+  if (state && --state->references == 0) delete state;
+}
+
+class LocalAcrylicGeometryRef {
+ public:
+  explicit LocalAcrylicGeometryRef(LocalAcrylicGeometryState* state)
+      : state_(state) {
+    if (state_) ++state_->references;
+  }
+  ~LocalAcrylicGeometryRef() { ReleaseLocalAcrylicGeometry(state_); }
+  LocalAcrylicGeometryRef(const LocalAcrylicGeometryRef&) = delete;
+  LocalAcrylicGeometryRef& operator=(const LocalAcrylicGeometryRef&) = delete;
+
+ private:
+  LocalAcrylicGeometryState* state_;
+};
+
+void RequestLocalAcrylicGeometry(LocalAcrylicGeometryState* state) {
+  if (!state || !state->panel) return;
+  LocalAcrylicGeometryRef hold(state);
+  state->pending = true;
+  if (state->depth || state->syncing) return;
+
+  // Updating the second HWND can itself produce window messages. Coalesce a
+  // real follow-up, but never recurse or run an unbounded positioning loop.
+  for (unsigned pass = 0; pass < 2 && state->pending && state->panel; ++pass) {
+    state->pending = false;
+    state->syncing = true;
+    state->panel->ShowAcrylicBackdrop();
+    state->syncing = false;
+  }
+}
+
+bool DeferLocalAcrylicGeometry(HWND hwnd) {
+  auto state = LocalAcrylicGeometry(hwnd);
+  if (!state || !state->depth) return false;
+  state->pending = true;
+  return true;
+}
+
+class LocalAcrylicGeometryBatch {
+ public:
+  explicit LocalAcrylicGeometryBatch(HWND hwnd)
+      : state_(LocalAcrylicGeometry(hwnd)), hold_(state_) {
+    if (state_) {
+      ++state_->depth;
+      // Layout can change its content inset without a HWND size change.
+      state_->pending = true;
+    }
+  }
+  ~LocalAcrylicGeometryBatch() {
+    if (state_ && --state_->depth == 0 && state_->pending)
+      RequestLocalAcrylicGeometry(state_);
+  }
+  LocalAcrylicGeometryBatch(const LocalAcrylicGeometryBatch&) = delete;
+  LocalAcrylicGeometryBatch& operator=(const LocalAcrylicGeometryBatch&) =
+      delete;
+
+ private:
+  LocalAcrylicGeometryState* state_;
+  LocalAcrylicGeometryRef hold_;
+};
+
+LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd, UINT message,
+                                          WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR id, DWORD_PTR data);
+
+void DetachLocalAcrylicGeometry(LocalAcrylicGeometryState* state,
+                                bool destroying = false) {
+  if (!state) return;
+  state->panel = nullptr;
+  state->pending = false;
+  if (LocalAcrylicGeometry(state->candidate) == state) {
+    ::RemovePropW(state->candidate, kLocalAcrylicGeometryProperty);
+    ::RemovePropW(state->candidate, kLocalAcrylicGeometryPolicy);
+  }
+  if (state->installed) {
+    const BOOL removed =
+        ::RemoveWindowSubclass(state->candidate, LocalAcrylicGeometryProc,
+                               kLocalAcrylicGeometrySubclass);
+    // If removal fails, keep the callback's reference until WM_NCDESTROY.
+    // A callback left installed must never point at freed state or panel data.
+    if (removed || destroying) {
+      state->installed = false;
+      ReleaseLocalAcrylicGeometry(state);
+    }
+  }
+}
+
+void RemoveLocalAcrylicGeometry(HWND hwnd) {
+  DetachLocalAcrylicGeometry(LocalAcrylicGeometry(hwnd));
+}
+
+LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd, UINT message,
+                                          WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR id, DWORD_PTR data) {
+  auto state = reinterpret_cast<LocalAcrylicGeometryState*>(data);
+  LocalAcrylicGeometryRef hold(state);
+  if (message == WM_NCDESTROY) {
+    DetachLocalAcrylicGeometry(state, true);
+    return ::DefSubclassProc(hwnd, message, wParam, lParam);
+  }
+
+  // Let ATL and the application's existing handlers finish first. No layout
+  // or pointer is read until the final HWND state is available. Destruction
+  // during default processing nulls panel while hold keeps this state alive.
+  const LRESULT result = ::DefSubclassProc(hwnd, message, wParam, lParam);
+  if (message == WM_WINDOWPOSCHANGED || message == WM_SHOWWINDOW)
+    RequestLocalAcrylicGeometry(state);
+  return result;
+}
+
+bool InstallLocalAcrylicGeometry(HWND hwnd, WeaselPanel* panel) {
+  if (!hwnd || !panel) return false;
+  if (LocalAcrylicGeometry(hwnd)) return true;
+  auto state = new (std::nothrow) LocalAcrylicGeometryState;
+  if (!state) return false;
+  state->candidate = hwnd;
+  state->panel = panel;
+  if (!::SetPropW(hwnd, kLocalAcrylicGeometryProperty,
+                  reinterpret_cast<HANDLE>(state))) {
+    ReleaseLocalAcrylicGeometry(state);
+    return false;
+  }
+  if (!::SetWindowSubclass(hwnd, LocalAcrylicGeometryProc,
+                           kLocalAcrylicGeometrySubclass,
+                           reinterpret_cast<DWORD_PTR>(state))) {
+    ::RemovePropW(hwnd, kLocalAcrylicGeometryProperty);
+    ReleaseLocalAcrylicGeometry(state);
+    return false;
+  }
+  state->installed = true;
+  ::SetPropW(hwnd, kLocalAcrylicGeometryPolicy,
+             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(1)));
+  return true;
+}
+
+bool LocalAcrylicGeometryMatches(HWND backdrop, HWND candidate, int x, int y,
+                                 int width, int height) {
+  RECT actual = {};
+  return ::IsWindowVisible(backdrop) && ::GetWindowRect(backdrop, &actual) &&
+         actual.left == x && actual.top == y && actual.right == x + width &&
+         actual.bottom == y + height &&
+         ::GetWindow(candidate, GW_HWNDNEXT) == backdrop;
+}
 
 COLORREF WithAlpha(COLORREF color, BYTE alpha) {
   return (color & 0x00FFFFFFu) | (static_cast<COLORREF>(alpha) << 24);
@@ -1093,6 +1267,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   return false;
 }
 void WeaselPanel::_DestroyAcrylicBackdrop() {
+  RemoveLocalAcrylicGeometry(m_hWnd);
   DestroyExternalState(m_acrylicBackdrop);
   m_acrylicBackdropEnabled = false;
   if (m_acrylicBackdrop) {
@@ -1125,6 +1300,10 @@ bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
 }
 
 void WeaselPanel::_SyncAcrylicBackdrop() {
+  auto localState = LocalAcrylicGeometry(m_hWnd);
+  LocalAcrylicGeometryRef lifetime(localState);
+  if (DeferLocalAcrylicGeometry(m_hWnd))
+    return;
   if (!_ShouldShowAcrylicBackdrop() || !::IsWindowVisible(m_hWnd)) {
     HideAcrylicBackdrop();
     return;
@@ -1156,6 +1335,15 @@ void WeaselPanel::_SyncAcrylicBackdrop() {
   if (m_in_server && ExternalBorrowed(m_acrylicBackdrop))
     EndExternalServerLease(m_acrylicBackdrop, ExternalState(m_acrylicBackdrop));
   _UpdateAcrylicBackdropTheme();
+  // Theme updates can re-enter the host and destroy/recreate this panel.
+  if (localState && !localState->panel)
+    return;
+
+  // Skip duplicate geometry/visibility/Z-order work, including notifications
+  // caused by our own SetWindowPos. Re-check the HWNDs, not a stale cache.
+  if (LocalAcrylicGeometryMatches(m_acrylicBackdrop, m_hWnd, x, y, width,
+                                  height))
+    return;
 
   // Keep the DWM Acrylic host immediately below the existing layered
   // Weasel candidate panel.
@@ -1164,6 +1352,11 @@ void WeaselPanel::_SyncAcrylicBackdrop() {
 }
 
 void WeaselPanel::ShowAcrylicBackdrop() {
+  auto state = LocalAcrylicGeometry(m_hWnd);
+  if (state && !state->syncing) {
+    RequestLocalAcrylicGeometry(state);
+    return;
+  }
   _SyncAcrylicBackdrop();
 }
 
@@ -1208,6 +1401,7 @@ void WeaselPanel::_CreateLayout() {
 
 // 更新界面
 void WeaselPanel::Refresh() {
+  LocalAcrylicGeometryBatch geometry(m_hWnd);
   bool should_show_icon =
       (m_status.ascii_mode || !m_status.composing || !m_ctx.aux.empty());
   m_candidateCount = min(m_ctx.cinfo.candies.size(), MAX_CANDIDATES_COUNT);
@@ -2061,6 +2255,7 @@ bool WeaselPanel::_DrawCandidates(CDCHandle& dc, bool back) {
 
 // draw client area
 void WeaselPanel::DoPaint(CDCHandle dc) {
+  LocalAcrylicGeometryBatch geometry(m_hWnd);
   // turn off WS_EX_TRANSPARENT, for better resp performance
   ModifyStyleEx(WS_EX_TRANSPARENT, WS_EX_LAYERED);
   GetClientRect(&rcw);
@@ -2233,6 +2428,8 @@ LRESULT WeaselPanel::OnCreate(UINT uMsg,
   m_mouse_entry = false;
   m_hoverIndex = -1;
   m_acrylicBackdropEnabled = _CreateAcrylicBackdrop();
+  if (m_acrylicBackdropEnabled)
+    InstallLocalAcrylicGeometry(m_hWnd, this);
   Refresh();
   return TRUE;
 }
@@ -2259,6 +2456,7 @@ LRESULT WeaselPanel::OnDpiChanged(UINT uMsg,
 }
 
 void WeaselPanel::MoveTo(RECT const& rc) {
+  LocalAcrylicGeometryBatch geometry(m_hWnd);
   if (!m_layout)
     return;  // avoid handling nullptr in _RepositionWindow
   m_redraw_by_monitor_change = false;
@@ -2306,10 +2504,10 @@ void WeaselPanel::MoveTo(RECT const& rc) {
         m_layout->ShouldDisplayStatusIcon() || m_redraw_by_monitor_change)
       RedrawWindow();
   }
-  // CI #20 has already finalized the real candidate position. Only publish
-  // its content rectangle; never repeat the owner-translation calculation.
-  if (!m_in_server && !m_acrylicBackdropEnabled && IsExternalSettingsClient())
-    _SyncAcrylicBackdrop();
+  // Both local and external Acrylic follow the final candidate position.
+  // Local batches defer this until layout/painting is complete; Settings
+  // retains the CI #21 asynchronous publish path without owner translation.
+  _SyncAcrylicBackdrop();
 }
 
 void WeaselPanel::_RepositionWindow(const bool& adj) {
