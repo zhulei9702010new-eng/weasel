@@ -132,59 +132,35 @@ jobs:
         if: matrix.variant == 'xmake'
         uses: xmake-io/github-action-setup-xmake@v1
 
-      - name: Build Windows App SDK Acrylic helper
+      - name: Build Windows App SDK Acrylic helper (x64)
         if: matrix.variant == 'xmake'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /t:Restore /p:Configuration=Release /p:Platform=x64
-          if ($LASTEXITCODE -ne 0) { throw 'Acrylic helper restore failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Acrylic x64 helper restore failed' }
           msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /m /p:Configuration=Release /p:Platform=x64
-          if ($LASTEXITCODE -ne 0) { throw 'Acrylic helper build failed' }
-      - name: Prepare and verify Acrylic runtime pair
+          if ($LASTEXITCODE -ne 0) { throw 'Acrylic x64 helper build failed' }
+
+      - name: Prepare and verify Acrylic runtime pair (x64)
+        if: matrix.variant == 'xmake'
+        shell: pwsh
+        run: .\AcrylicAppSdkPoC\verify-runtime.ps1 -Architecture x64
+
+      - name: Build Windows App SDK Acrylic helper (x86)
         if: matrix.variant == 'xmake'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Read resolved files from THIS restore, not a guessed/global version.
-          $assetsFiles = @(Get-ChildItem .\AcrylicAppSdkPoC -Filter project.assets.json -Recurse)
-          if ($assetsFiles.Count -ne 1) { throw 'Expected one helper assets file' }
-          $assets = Get-Content -LiteralPath $assetsFiles[0].FullName -Raw | ConvertFrom-Json
-          function Get-PeMachine([string]$filePath) {
-            $bytes = [IO.File]::ReadAllBytes($filePath)
-            if ($bytes.Length -lt 64 -or $bytes[0] -ne 77 -or $bytes[1] -ne 90) { return 0 }
-            $pe = [BitConverter]::ToInt32($bytes, 60)
-            if ($pe -lt 0 -or $pe + 6 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $pe) -ne 17744) { return 0 }
-            return [BitConverter]::ToUInt16($bytes, $pe + 4)
-          }
-          $sources = @()
-          foreach ($library in $assets.libraries.PSObject.Properties) {
-            if ($library.Value.type -ne 'package') { continue }
-            foreach ($file in $library.Value.files) {
-              if ($file -notmatch '(^|/)Microsoft\.WindowsAppRuntime\.Bootstrap\.dll$') { continue }
-              foreach ($folder in $assets.packageFolders.PSObject.Properties.Name) {
-                $source = Join-Path (Join-Path $folder $library.Value.path) $file
-                if ((Test-Path -LiteralPath $source -PathType Leaf) -and (Get-PeMachine $source) -eq 34404) { $sources += $source }
-              }
-            }
-          }
-          $sources = @($sources | Select-Object -Unique)
-          if ($sources.Count -eq 0) { throw 'x64 bootstrap DLL not found in resolved NuGet assets' }
-          $hashes = @($sources | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash } | Select-Object -Unique)
-          if ($hashes.Count -ne 1) { throw 'Conflicting bootstrap binaries in helper restore' }
-          Copy-Item -LiteralPath $sources[0] -Destination .\output\Microsoft.WindowsAppRuntime.Bootstrap.dll -Force
-          foreach ($file in @('.\output\WeaselAcrylicAppSdk.dll', '.\output\Microsoft.WindowsAppRuntime.Bootstrap.dll')) {
-            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing runtime file: $file" }
-            if ((Get-PeMachine $file) -ne 34404) { throw "Runtime file is not x64: $file" }
-          }
-          $exports = (& dumpbin /nologo /exports .\output\WeaselAcrylicAppSdk.dll) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'dumpbin helper exports failed' }
-          foreach ($symbol in @('WeaselAcrylicAppSdkAttach','WeaselAcrylicAppSdkDetach','WeaselAcrylicAppSdkSetWindowTheme','WeaselAcrylicAppSdkIsWindowActive','WeaselAcrylicAppSdkRequestThreadShutdown','WeaselAcrylicAppSdkShutdownThread','WeaselAcrylicAppSdkGetLifetimePolicyVersion')) {
-            if ($exports -notmatch [regex]::Escape($symbol)) { throw "Missing helper export: $symbol" }
-          }
-          $imports = (& dumpbin /nologo /imports .\output\WeaselAcrylicAppSdk.dll) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'dumpbin helper imports failed' }
-          if ($imports -match 'MddBootstrapInitialize') { throw 'Unexpected static bootstrap import' }
+          msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /t:Restore /p:Configuration=Release /p:Platform=Win32
+          if ($LASTEXITCODE -ne 0) { throw 'Acrylic x86 helper restore failed' }
+          msbuild .\AcrylicAppSdkPoC\AcrylicAppSdkPoC.vcxproj /m /p:Configuration=Release /p:Platform=Win32
+          if ($LASTEXITCODE -ne 0) { throw 'Acrylic x86 helper build failed' }
+
+      - name: Prepare and verify Acrylic runtime pair (x86)
+        if: matrix.variant == 'xmake'
+        shell: pwsh
+        run: .\AcrylicAppSdkPoC\verify-runtime.ps1 -Architecture x86
 
       - name: Build Weasel
         shell: pwsh
@@ -209,23 +185,8 @@ jobs:
       - name: Verify Acrylic DLLs in xmake installer
         if: matrix.variant == 'xmake'
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $installer = Get-ChildItem .\output\archives\weasel*.exe |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $installer) {
-            throw 'xmake installer not found'
-          }
+        run: .\AcrylicAppSdkPoC\verify-runtime.ps1 -VerifyInstaller
 
-          $listing = (& .\output\7z.exe l $installer.FullName) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect installer archive' }
-          if ($listing -notmatch 'WeaselAcrylicAppSdk\.dll') {
-            throw 'WeaselAcrylicAppSdk.dll is missing from installer'
-          }
-          if ($listing -notmatch 'Microsoft\.WindowsAppRuntime\.Bootstrap\.dll') {
-            throw 'Microsoft.WindowsAppRuntime.Bootstrap.dll is missing from installer'
-          }
       - name: Upload WinAppSDK Acrylic helper artifact
         if: matrix.variant == 'xmake'
         uses: actions/upload-artifact@v4
@@ -235,6 +196,10 @@ jobs:
           path: |
             .\output\WeaselAcrylicAppSdk.dll
             .\output\Microsoft.WindowsAppRuntime.Bootstrap.dll
+            .\output\acrylic\x86\WeaselAcrylicAppSdk.dll
+            .\output\acrylic\x86\Microsoft.WindowsAppRuntime.Bootstrap.dll
+            .\output\acrylic-runtime-x64.json
+            .\output\acrylic-runtime-x86.json
 
       - name: Upload xmake installer artifact
         if: matrix.variant == 'xmake'

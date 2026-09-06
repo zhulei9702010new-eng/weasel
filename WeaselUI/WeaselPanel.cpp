@@ -169,9 +169,9 @@ class AcrylicAppSdkBridge {
   bool TryInitialize(HWND hwnd, BOOL darkMode, bool inServer) {
     if (!hwnd || !::IsWindow(hwnd))
       return false;
-#if !defined(_M_X64) || defined(_M_ARM64EC)
-    // The current build packages an x64 helper only. Keep Win32/ARM clients
-    // functional without attempting to load a DLL of the wrong architecture.
+#if (!defined(_M_X64) && !defined(_M_IX86)) || defined(_M_ARM64EC)
+    // Build-matched x64 and x86 helpers are packaged separately. Native ARM
+    // clients keep the normal skin without loading an incompatible DLL.
     SetAcrylicDiagnostic(hwnd, -10,
                          HRESULT_FROM_WIN32(ERROR_EXE_MACHINE_TYPE_MISMATCH));
     return false;
@@ -264,6 +264,10 @@ class AcrylicAppSdkBridge {
     }
     if (FAILED(loadResult_))
       return;
+#if defined(_M_IX86)
+    // Select by THIS process's architecture, not the OS/server architecture.
+    root += L"\\acrylic\\x86";
+#endif
     std::wstring helperPath = root + L"\\" + kWeaselAcrylicAppSdkDll;
     loadStage_ = -30;
     module_ = ::LoadLibraryExW(

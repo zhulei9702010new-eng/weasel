@@ -1,0 +1,18 @@
+; x86 only. Preserve the undecorated names used by GetProcAddress.
+; All parameters in these exports are four-byte scalars/pointers on x86.
+LIBRARY WeaselAcrylicAppSdk
+EXPORTS
+  WeaselAcrylicAppSdkGetLifetimePolicyVersion=_WeaselAcrylicAppSdkGetLifetimePolicyVersion@0
+  WeaselAcrylicAppSdkGetLastStage=_WeaselAcrylicAppSdkGetLastStage@0
+  WeaselAcrylicAppSdkGetLastHresult=_WeaselAcrylicAppSdkGetLastHresult@0
+  WeaselAcrylicAppSdkGetLastMessage=_WeaselAcrylicAppSdkGetLastMessage@0
+  WeaselAcrylicAppSdkAttach=_WeaselAcrylicAppSdkAttach@8
+  WeaselAcrylicAppSdkIsWindowActive=_WeaselAcrylicAppSdkIsWindowActive@4
+  WeaselAcrylicAppSdkSetWindowTheme=_WeaselAcrylicAppSdkSetWindowTheme@8
+  WeaselAcrylicAppSdkDetach=_WeaselAcrylicAppSdkDetach@4
+  WeaselAcrylicAppSdkRequestThreadShutdown=_WeaselAcrylicAppSdkRequestThreadShutdown@0
+  WeaselAcrylicAppSdkInitialize=_WeaselAcrylicAppSdkInitialize@8
+  WeaselAcrylicAppSdkIsActive=_WeaselAcrylicAppSdkIsActive@0
+  WeaselAcrylicAppSdkSetDarkMode=_WeaselAcrylicAppSdkSetDarkMode@4
+  WeaselAcrylicAppSdkShutdown=_WeaselAcrylicAppSdkShutdown@0
+  WeaselAcrylicAppSdkShutdownThread=_WeaselAcrylicAppSdkShutdownThread@4
