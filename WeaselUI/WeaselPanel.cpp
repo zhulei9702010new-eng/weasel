@@ -74,14 +74,16 @@ LocalAcrylicGeometryState* LocalAcrylicGeometry(HWND hwnd) {
 }
 
 void ReleaseLocalAcrylicGeometry(LocalAcrylicGeometryState* state) {
-  if (state && --state->references == 0) delete state;
+  if (state && --state->references == 0)
+    delete state;
 }
 
 class LocalAcrylicGeometryRef {
  public:
   explicit LocalAcrylicGeometryRef(LocalAcrylicGeometryState* state)
       : state_(state) {
-    if (state_) ++state_->references;
+    if (state_)
+      ++state_->references;
   }
   ~LocalAcrylicGeometryRef() { ReleaseLocalAcrylicGeometry(state_); }
   LocalAcrylicGeometryRef(const LocalAcrylicGeometryRef&) = delete;
@@ -92,10 +94,12 @@ class LocalAcrylicGeometryRef {
 };
 
 void RequestLocalAcrylicGeometry(LocalAcrylicGeometryState* state) {
-  if (!state || !state->panel) return;
+  if (!state || !state->panel)
+    return;
   LocalAcrylicGeometryRef hold(state);
   state->pending = true;
-  if (state->depth || state->syncing) return;
+  if (state->depth || state->syncing)
+    return;
 
   // Updating the second HWND can itself produce window messages. Coalesce a
   // real follow-up, but never recurse or run an unbounded positioning loop.
@@ -109,7 +113,8 @@ void RequestLocalAcrylicGeometry(LocalAcrylicGeometryState* state) {
 
 bool DeferLocalAcrylicGeometry(HWND hwnd) {
   auto state = LocalAcrylicGeometry(hwnd);
-  if (!state || !state->depth) return false;
+  if (!state || !state->depth)
+    return false;
   state->pending = true;
   return true;
 }
@@ -137,13 +142,17 @@ class LocalAcrylicGeometryBatch {
   LocalAcrylicGeometryRef hold_;
 };
 
-LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd, UINT message,
-                                          WPARAM wParam, LPARAM lParam,
-                                          UINT_PTR id, DWORD_PTR data);
+LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd,
+                                          UINT message,
+                                          WPARAM wParam,
+                                          LPARAM lParam,
+                                          UINT_PTR id,
+                                          DWORD_PTR data);
 
 void DetachLocalAcrylicGeometry(LocalAcrylicGeometryState* state,
                                 bool destroying = false) {
-  if (!state) return;
+  if (!state)
+    return;
   state->panel = nullptr;
   state->pending = false;
   if (LocalAcrylicGeometry(state->candidate) == state) {
@@ -167,9 +176,12 @@ void RemoveLocalAcrylicGeometry(HWND hwnd) {
   DetachLocalAcrylicGeometry(LocalAcrylicGeometry(hwnd));
 }
 
-LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd, UINT message,
-                                          WPARAM wParam, LPARAM lParam,
-                                          UINT_PTR id, DWORD_PTR data) {
+LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd,
+                                          UINT message,
+                                          WPARAM wParam,
+                                          LPARAM lParam,
+                                          UINT_PTR id,
+                                          DWORD_PTR data) {
   auto state = reinterpret_cast<LocalAcrylicGeometryState*>(data);
   LocalAcrylicGeometryRef hold(state);
   if (message == WM_NCDESTROY) {
@@ -187,10 +199,13 @@ LRESULT CALLBACK LocalAcrylicGeometryProc(HWND hwnd, UINT message,
 }
 
 bool InstallLocalAcrylicGeometry(HWND hwnd, WeaselPanel* panel) {
-  if (!hwnd || !panel) return false;
-  if (LocalAcrylicGeometry(hwnd)) return true;
+  if (!hwnd || !panel)
+    return false;
+  if (LocalAcrylicGeometry(hwnd))
+    return true;
   auto state = new (std::nothrow) LocalAcrylicGeometryState;
-  if (!state) return false;
+  if (!state)
+    return false;
   state->candidate = hwnd;
   state->panel = panel;
   if (!::SetPropW(hwnd, kLocalAcrylicGeometryProperty,
@@ -211,8 +226,12 @@ bool InstallLocalAcrylicGeometry(HWND hwnd, WeaselPanel* panel) {
   return true;
 }
 
-bool LocalAcrylicGeometryMatches(HWND backdrop, HWND candidate, int x, int y,
-                                 int width, int height) {
+bool LocalAcrylicGeometryMatches(HWND backdrop,
+                                 HWND candidate,
+                                 int x,
+                                 int y,
+                                 int width,
+                                 int height) {
   RECT actual = {};
   return ::IsWindowVisible(backdrop) && ::GetWindowRect(backdrop, &actual) &&
          actual.left == x && actual.top == y && actual.right == x + width &&
