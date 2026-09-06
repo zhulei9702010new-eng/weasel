@@ -1,6 +1,7 @@
 #pragma once
 #include <WeaselUI.h>
 #include "ctffunc.h"
+#include "CandidateOwnerAnchor.h"
 
 class WeaselTSF;
 
@@ -66,6 +67,33 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   weasel::UIStyle& style();
 
  private:
+  // B.2f v2a: only SystemSettings gets the owner-translation fallback.
+  bool _IsSettingsHost() const;
+  bool _ReadOwnerGeometry(
+      weasel::candidate_motion::OwnerGeometry& geometry) const;
+  void _StartOwnerFollow();
+  void _StopOwnerFollow(bool destroyWindow);
+  void _TickOwnerFollow();
+  void _PublishOwnerFollowDiagnostics();
+  static LRESULT CALLBACK _OwnerFollowWndProc(HWND hwnd,
+                                              UINT message,
+                                              WPARAM wParam,
+                                              LPARAM lParam);
+
+  const bool _settingsFollowEnabled;
+  HWND _followView = nullptr;
+  HWND _followWindow = nullptr;
+  bool _followTimerActive = false;
+  bool _followTickBusy = false;
+  bool _haveEffectiveAnchor = false;
+  RECT _effectiveAnchor = {};
+  weasel::candidate_motion::OwnerAnchor _ownerAnchor;
+  ULONG _followSourceUpdates = 0;
+  ULONG _followTranslations = 0;
+  ULONG _followRepeatedSources = 0;
+  ULONG _followLayoutInvalidations = 0;
+  ULONG _followReadFailures = 0;
+
   // void _UpdateOwner();
   HWND _GetActiveWnd();
   HRESULT _UpdateUIElement();
