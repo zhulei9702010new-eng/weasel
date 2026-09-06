@@ -6,6 +6,7 @@
 #include <dwmapi.h>
 #include <string>
 #include <atomic>
+#include <new>
 #include <VersionHelpers.hpp>
 #include <WeaselIPCData.h>
 #include <algorithm>
@@ -55,10 +56,19 @@ bool IsDarkColor(COLORREF color) {
   return luminance < 128000;
 }
 
+bool HandleExternalAcrylicMessage(HWND hwnd,
+                                  UINT message,
+                                  WPARAM wParam,
+                                  LPARAM lParam,
+                                  LRESULT& result);
+
 LRESULT CALLBACK AcrylicBackdropWndProc(HWND hwnd,
                                         UINT message,
                                         WPARAM wParam,
                                         LPARAM lParam) {
+  LRESULT result = 0;
+  if (HandleExternalAcrylicMessage(hwnd, message, wParam, lParam, result))
+    return result;
   switch (message) {
     case WM_ERASEBKGND:
       return 1;
@@ -325,6 +335,620 @@ class AcrylicAppSdkBridge {
 };
 
 AcrylicAppSdkBridge g_acrylicAppSdkBridge;
+
+// B.2f v2b: optional, asynchronous Settings -> WeaselServer backdrop lease.
+// Only HWNDs and integer tokens cross processes. The client publishes the final
+// content rectangle; the server never calculates a second caret/owner offset.
+constexpr UINT kExternalUpdate = WM_APP + 0x51A;
+constexpr UINT kExternalRelease = WM_APP + 0x51B;
+constexpr UINT kExternalAck = WM_APP + 0x51C;
+constexpr UINT_PTR kExternalTimer = 0x51A;
+constexpr DWORD kExternalProtocol = 2;
+constexpr DWORD kExternalTimeoutMs = 600;
+constexpr DWORD kExternalRetryMs = 1000;
+constexpr wchar_t kExtProtocol[] = L"WeaselAcrylicExternalProtocol";
+constexpr wchar_t kExtServer[] = L"WeaselAcrylicExternalServer";
+constexpr wchar_t kExtToken[] = L"WeaselAcrylicExternalToken";
+constexpr wchar_t kExtSequence[] = L"WeaselAcrylicExternalSequence";
+constexpr wchar_t kExtCandidate[] = L"WeaselAcrylicExternalCandidate";
+constexpr wchar_t kExtWanted[] = L"WeaselAcrylicExternalWanted";
+constexpr wchar_t kExtX[] = L"WeaselAcrylicExternalX";
+constexpr wchar_t kExtY[] = L"WeaselAcrylicExternalY";
+constexpr wchar_t kExtWidth[] = L"WeaselAcrylicExternalWidth";
+constexpr wchar_t kExtHeight[] = L"WeaselAcrylicExternalHeight";
+constexpr wchar_t kExtDark[] = L"WeaselAcrylicExternalDark";
+constexpr wchar_t kExtClientPulse[] = L"WeaselAcrylicExternalClientPulse";
+constexpr wchar_t kExtServerPulse[] = L"WeaselAcrylicExternalServerPulse";
+constexpr wchar_t kExtOwner[] = L"WeaselAcrylicExternalOwner";
+constexpr wchar_t kExtActive[] = L"WeaselAcrylicExternalActive";
+constexpr wchar_t kExtAckClient[] = L"WeaselAcrylicExternalAckClient";
+constexpr wchar_t kExtAckToken[] = L"WeaselAcrylicExternalAckToken";
+constexpr wchar_t kExtAckSequence[] = L"WeaselAcrylicExternalAckSequence";
+constexpr wchar_t kExtRenderer[] = L"WeaselAcrylicExternalRendererHwnd";
+constexpr wchar_t kExtReady[] = L"WeaselAcrylicExternalReady";
+
+struct ExternalSnapshot {
+  HWND candidate = nullptr;
+  DWORD token = 0;
+  DWORD sequence = 0;
+  int x = 0;
+  int y = 0;
+  int width = 0;
+  int height = 0;
+  BOOL dark = FALSE;
+};
+
+struct ExternalAcrylicState {
+  bool server = false;
+  bool active = false;
+  bool foregroundReady = false;
+  bool pending = false;
+  bool attempted = false;
+  bool redrawing = false;
+  HWND candidate = nullptr;
+  HWND peer = nullptr;
+  WeaselPanel* panel = nullptr;  // Local pointer only, never published via IPC.
+  ExternalSnapshot snapshot;
+  DWORD token = 0;
+  DWORD lastAttempt = 0;
+  DWORD pendingSince = 0;
+  DWORD pendingSequence = 0;
+};
+
+ULONG_PTR ExternalProperty(HWND hwnd, const wchar_t* name) {
+  return reinterpret_cast<ULONG_PTR>(::GetPropW(hwnd, name));
+}
+
+bool SetExternalProperty(HWND hwnd, const wchar_t* name, ULONG_PTR value) {
+  return ::SetPropW(hwnd, name, reinterpret_cast<HANDLE>(value)) != FALSE;
+}
+
+bool ExternalFresh(DWORD now, DWORD then) {
+  return static_cast<DWORD>(now - then) <= kExternalTimeoutMs;
+}
+
+ExternalAcrylicState* ExternalState(HWND hwnd) {
+  return hwnd ? reinterpret_cast<ExternalAcrylicState*>(
+                    ::GetWindowLongPtrW(hwnd, GWLP_USERDATA))
+              : nullptr;
+}
+
+bool IsSettingsImage(const wchar_t* path, DWORD length) {
+  wchar_t windows[32768] = {};
+  const UINT count = ::GetWindowsDirectoryW(windows, _countof(windows));
+  if (!count || count >= _countof(windows))
+    return false;
+  const std::wstring expected = std::wstring(windows, count) +
+                                L"\\ImmersiveControlPanel\\SystemSettings.exe";
+  return ::CompareStringOrdinal(
+             path, static_cast<int>(length), expected.c_str(),
+             static_cast<int>(expected.size()), TRUE) == CSTR_EQUAL;
+}
+
+bool IsExternalSettingsClient() {
+#if defined(_M_X64) && !defined(_M_ARM64EC)
+  static const bool settings = []() {
+    wchar_t path[32768] = {};
+    const DWORD count = ::GetModuleFileNameW(nullptr, path, _countof(path));
+    return count && count < _countof(path) && IsSettingsImage(path, count);
+  }();
+  return settings;
+#else
+  return false;
+#endif
+}
+
+bool ExternalProcessMatches(DWORD pid, bool settings) {
+  DWORD currentSession = 0;
+  DWORD otherSession = 0;
+  if (!pid || pid == ::GetCurrentProcessId() ||
+      !::ProcessIdToSessionId(::GetCurrentProcessId(), &currentSession) ||
+      !::ProcessIdToSessionId(pid, &otherSession) ||
+      currentSession != otherSession)
+    return false;
+  HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process)
+    return false;
+  wchar_t path[32768] = {};
+  DWORD count = _countof(path);
+  const BOOL queried = ::QueryFullProcessImageNameW(process, 0, path, &count);
+  ::CloseHandle(process);
+  if (!queried || !count)
+    return false;
+  if (settings)
+    return IsSettingsImage(path, count);
+  std::wstring root;
+  if (FAILED(ReadAcrylicInstallRoot(root)))
+    return false;
+  const std::wstring expected = root + L"\\WeaselServer.exe";
+  return ::CompareStringOrdinal(path, static_cast<int>(count), expected.c_str(),
+                                static_cast<int>(expected.size()),
+                                TRUE) == CSTR_EQUAL;
+}
+
+bool IsExternalHostClass(HWND hwnd) {
+  wchar_t name[64] = {};
+  return hwnd && ::IsWindow(hwnd) &&
+         ::GetClassNameW(hwnd, name, _countof(name)) &&
+         ::lstrcmpW(name, kWeaselAcrylicBackdropClass) == 0;
+}
+
+bool ExternalCandidateVisible(HWND candidate) {
+  if (!candidate || !::IsWindow(candidate) || !::IsWindowVisible(candidate))
+    return false;
+  const HWND owner = ::GetWindow(candidate, GW_OWNER);
+  if (owner && (!::IsWindowVisible(owner) || ::IsIconic(owner)))
+    return false;
+  DWORD cloaked = 0;
+  if (owner &&
+      SUCCEEDED(::DwmGetWindowAttribute(owner, DWMWA_CLOAKED, &cloaked,
+                                        sizeof(cloaked))) &&
+      cloaked)
+    return false;
+  return true;
+}
+
+bool ExternalServerAvailable(HWND hwnd) {
+  return IsExternalHostClass(hwnd) &&
+         ExternalProperty(hwnd, kExtProtocol) == kExternalProtocol &&
+         ExternalProperty(hwnd, kExtServer) == 1 &&
+         ExternalProperty(hwnd, kWeaselAcrylicAppSdkActiveProperty) == 1 &&
+         ExternalProperty(hwnd, kAcrylicStageProperty) == 100;
+}
+
+BOOL CALLBACK FindExternalServerCallback(HWND hwnd, LPARAM parameter) {
+  if (!ExternalServerAvailable(hwnd) ||
+      (::IsWindowVisible(hwnd) && ExternalProperty(hwnd, kExtActive) != 1))
+    return TRUE;
+  DWORD pid = 0;
+  ::GetWindowThreadProcessId(hwnd, &pid);
+  if (!ExternalProcessMatches(pid, false))
+    return TRUE;
+  *reinterpret_cast<HWND*>(parameter) = hwnd;
+  return FALSE;
+}
+
+HWND FindExternalServer() {
+  HWND result = nullptr;
+  ::EnumWindows(FindExternalServerCallback, reinterpret_cast<LPARAM>(&result));
+  return result;
+}
+
+ExternalAcrylicState* MakeExternalState(HWND hwnd, bool server) {
+  if (auto state = ExternalState(hwnd))
+    return state->server == server ? state : nullptr;
+  auto state = new (std::nothrow) ExternalAcrylicState;
+  if (!state)
+    return nullptr;
+  state->server = server;
+  ::SetLastError(ERROR_SUCCESS);
+  ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+  if (::GetLastError() != ERROR_SUCCESS) {
+    delete state;
+    return nullptr;
+  }
+  return state;
+}
+
+void PrepareExternalServer(HWND hwnd) {
+#if defined(_M_X64) && !defined(_M_ARM64EC)
+  if (!MakeExternalState(hwnd, true))
+    return;
+  if (!SetExternalProperty(hwnd, kExtProtocol, kExternalProtocol) ||
+      !SetExternalProperty(hwnd, kExtServer, 1)) {
+    ::RemovePropW(hwnd, kExtProtocol);
+    ::RemovePropW(hwnd, kExtServer);
+  }
+#endif
+}
+
+bool ExternalBorrowed(HWND hwnd) {
+  const auto state = ExternalState(hwnd);
+  return state && state->server && state->active;
+}
+
+void EndExternalServerLease(HWND hwnd, ExternalAcrylicState* state) {
+  if (!state || !state->server || !state->active)
+    return;
+  const HWND client = state->peer;
+  const DWORD token = state->token;
+  state->active = false;
+  state->peer = nullptr;
+  state->candidate = nullptr;
+  ::KillTimer(hwnd, kExternalTimer);
+  ::RemovePropW(hwnd, kExtActive);
+  ::RemovePropW(hwnd, kExtOwner);
+  ::RemovePropW(hwnd, kExtAckClient);
+  ::RemovePropW(hwnd, kExtAckToken);
+  ::RemovePropW(hwnd, kExtAckSequence);
+  ::ShowWindow(hwnd, SW_HIDE);
+  if (client)
+    ::PostMessageW(client, kExternalAck, reinterpret_cast<WPARAM>(hwnd), token);
+}
+
+bool ReadExternalSnapshot(HWND client, DWORD token, ExternalSnapshot& snap) {
+  const DWORD seq = static_cast<DWORD>(ExternalProperty(client, kExtSequence));
+  if (!seq || (seq & 1) ||
+      ExternalProperty(client, kExtProtocol) != kExternalProtocol ||
+      ExternalProperty(client, kExtToken) != token ||
+      ExternalProperty(client, kExtWanted) != 1)
+    return false;
+  snap.candidate =
+      reinterpret_cast<HWND>(ExternalProperty(client, kExtCandidate));
+  snap.token = token;
+  snap.sequence = seq;
+  snap.x =
+      static_cast<LONG>(static_cast<DWORD>(ExternalProperty(client, kExtX)));
+  snap.y =
+      static_cast<LONG>(static_cast<DWORD>(ExternalProperty(client, kExtY)));
+  snap.width = static_cast<int>(ExternalProperty(client, kExtWidth));
+  snap.height = static_cast<int>(ExternalProperty(client, kExtHeight));
+  snap.dark = ExternalProperty(client, kExtDark) ? TRUE : FALSE;
+  return ExternalProperty(client, kExtSequence) == seq &&
+         ExternalProperty(client, kExtToken) == token &&
+         ExternalProperty(client, kExtWanted) == 1 && snap.width > 0 &&
+         snap.height > 0 && snap.width <= 32768 && snap.height <= 32768;
+}
+
+void ApplyExternalSnapshot(HWND hwnd,
+                           ExternalAcrylicState* state,
+                           HWND client,
+                           DWORD token) {
+  ExternalSnapshot snap;
+  if (!state || !state->server || !token || !ExternalServerAvailable(hwnd) ||
+      !IsExternalHostClass(client) ||
+      !ReadExternalSnapshot(client, token, snap) ||
+      !ExternalCandidateVisible(snap.candidate) ||
+      !ExternalFresh(::GetTickCount(), static_cast<DWORD>(ExternalProperty(
+                                           client, kExtClientPulse))))
+    return;
+  DWORD clientPid = 0;
+  DWORD candidatePid = 0;
+  ::GetWindowThreadProcessId(client, &clientPid);
+  ::GetWindowThreadProcessId(snap.candidate, &candidatePid);
+  if (!clientPid || clientPid != candidatePid)
+    return;
+  const bool sameLease = state->active && state->peer == client &&
+                         state->token == token &&
+                         state->candidate == snap.candidate;
+  if (!sameLease) {
+    if (!ExternalProcessMatches(clientPid, true))
+      return;
+    if (state->active && state->peer != client &&
+        ExternalCandidateVisible(state->candidate))
+      return;
+    if (::IsWindowVisible(hwnd) && !state->active)
+      return;  // Never borrow a backdrop displaying the server's own panel.
+    EndExternalServerLease(hwnd, state);
+    state->active = true;
+    state->peer = client;
+    state->candidate = snap.candidate;
+    state->token = token;
+    if (!::SetTimer(hwnd, kExternalTimer, 100, nullptr)) {
+      EndExternalServerLease(hwnd, state);
+      return;
+    }
+  }
+  if (!sameLease || state->snapshot.dark != snap.dark) {
+    ::DwmSetWindowAttribute(hwnd, kDwmaUseImmersiveDarkMode, &snap.dark,
+                            sizeof(snap.dark));
+    g_acrylicAppSdkBridge.SetDarkMode(hwnd, snap.dark);
+  }
+  if (!::SetWindowPos(hwnd, snap.candidate, snap.x, snap.y, snap.width,
+                      snap.height,
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER) ||
+      !SetExternalProperty(hwnd, kExtOwner,
+                           reinterpret_cast<ULONG_PTR>(snap.candidate)) ||
+      !SetExternalProperty(hwnd, kExtAckClient,
+                           reinterpret_cast<ULONG_PTR>(client)) ||
+      !SetExternalProperty(hwnd, kExtAckToken, token) ||
+      !SetExternalProperty(hwnd, kExtAckSequence, snap.sequence) ||
+      !SetExternalProperty(hwnd, kExtServerPulse, ::GetTickCount()) ||
+      !SetExternalProperty(hwnd, kExtActive, 1)) {
+    EndExternalServerLease(hwnd, state);
+    return;
+  }
+  state->snapshot = snap;
+  ::PostMessageW(client, kExternalAck, reinterpret_cast<WPARAM>(hwnd), token);
+}
+
+bool ExternalLeaseReady(HWND client, const ExternalAcrylicState* state) {
+  const HWND host = state ? state->peer : nullptr;
+  return state && !state->server && state->active && host &&
+         ExternalServerAvailable(host) && ::IsWindowVisible(host) &&
+         ExternalProperty(host, kExtActive) == 1 &&
+         ExternalProperty(host, kExtAckClient) ==
+             reinterpret_cast<ULONG_PTR>(client) &&
+         ExternalProperty(host, kExtAckToken) == state->token &&
+         ExternalProperty(host, kExtAckSequence) != 0 &&
+         ExternalProperty(host, kExtOwner) ==
+             reinterpret_cast<ULONG_PTR>(state->candidate) &&
+         ExternalFresh(::GetTickCount(), static_cast<DWORD>(ExternalProperty(
+                                             host, kExtServerPulse)));
+}
+
+void RefreshExternalForeground(HWND hwnd, ExternalAcrylicState* state) {
+  if (!state || state->server)
+    return;
+  const bool ready = ExternalLeaseReady(hwnd, state);
+  if (ready == state->foregroundReady)
+    return;
+  state->foregroundReady = ready;
+  if (ready) {
+    SetExternalProperty(state->candidate, kExtReady, 1);
+    SetExternalProperty(state->candidate, kExtRenderer,
+                        reinterpret_cast<ULONG_PTR>(state->peer));
+  } else {
+    ::RemovePropW(state->candidate, kExtReady);
+    ::RemovePropW(state->candidate, kExtRenderer);
+  }
+  // Some TSF hosts ignore WM_PAINT; use the existing direct redraw entry point.
+  if (!state->redrawing && state->panel && ::IsWindow(state->candidate) &&
+      ::IsWindowVisible(state->candidate)) {
+    state->redrawing = true;
+    state->panel->RedrawWindow();
+    if (ExternalState(hwnd) == state)
+      state->redrawing = false;
+  }
+}
+
+void ReleaseExternalClient(HWND hwnd) {
+  auto state = ExternalState(hwnd);
+  if (!state || state->server)
+    return;
+  ::KillTimer(hwnd, kExternalTimer);
+  SetExternalProperty(hwnd, kExtWanted, 0);
+  ::RemovePropW(hwnd, kExtToken);  // Reject delayed requests from this lease.
+  if (state->peer && state->active)
+    ::PostMessageW(state->peer, kExternalRelease,
+                   reinterpret_cast<WPARAM>(hwnd), state->token);
+  ::RemovePropW(state->candidate, kExtReady);
+  ::RemovePropW(state->candidate, kExtRenderer);
+  state->active = false;
+  state->pending = false;
+  state->foregroundReady = false;
+  state->attempted = false;
+  state->peer = nullptr;
+  state->token = 0;
+}
+
+DWORD NextExternalToken() {
+  static std::atomic<DWORD> counter{::GetTickCount() ^ ::GetCurrentProcessId()};
+  DWORD value = counter.fetch_add(1) + 1;
+  if (!value)
+    value = counter.fetch_add(1) + 1;
+  return value;
+}
+
+bool PublishExternalSnapshot(HWND hwnd,
+                             ExternalAcrylicState* state,
+                             const ExternalSnapshot& snap) {
+  DWORD seq = state->snapshot.sequence + 2;
+  if (!seq)
+    seq = 2;
+  if (!SetExternalProperty(hwnd, kExtSequence, seq - 1) ||
+      !SetExternalProperty(hwnd, kExtProtocol, kExternalProtocol) ||
+      !SetExternalProperty(hwnd, kExtCandidate,
+                           reinterpret_cast<ULONG_PTR>(state->candidate)) ||
+      !SetExternalProperty(hwnd, kExtToken, state->token) ||
+      !SetExternalProperty(hwnd, kExtX, static_cast<DWORD>(snap.x)) ||
+      !SetExternalProperty(hwnd, kExtY, static_cast<DWORD>(snap.y)) ||
+      !SetExternalProperty(hwnd, kExtWidth, snap.width) ||
+      !SetExternalProperty(hwnd, kExtHeight, snap.height) ||
+      !SetExternalProperty(hwnd, kExtDark, snap.dark ? 1 : 0) ||
+      !SetExternalProperty(hwnd, kExtClientPulse, ::GetTickCount()) ||
+      !SetExternalProperty(hwnd, kExtWanted, 1) ||
+      !SetExternalProperty(hwnd, kExtSequence, seq))
+    return false;
+  state->snapshot = snap;
+  state->snapshot.sequence = seq;
+  return true;
+}
+
+void RequestExternalSnapshot(HWND hwnd, ExternalAcrylicState* state) {
+  if (!state || state->server || !state->active)
+    return;
+  const DWORD now = ::GetTickCount();
+  if (state->peer && !ExternalServerAvailable(state->peer)) {
+    state->peer = nullptr;
+    state->pending = false;
+  }
+  if (state->pending && ExternalLeaseReady(hwnd, state)) {
+    const DWORD acknowledged =
+        static_cast<DWORD>(ExternalProperty(state->peer, kExtAckSequence));
+    if (static_cast<DWORD>(acknowledged - state->pendingSequence) < 0x80000000u)
+      state->pending = false;  // Recover even if the posted ACK was lost.
+  }
+  if (state->pending) {
+    if (static_cast<DWORD>(now - state->pendingSince) <= kExternalTimeoutMs)
+      return;
+    // Invalidate a late request before trying again; never wait on the input
+    // thread.
+    const HWND oldPeer = state->peer;
+    const DWORD oldToken = state->token;
+    state->token = NextExternalToken();
+    SetExternalProperty(hwnd, kExtToken, state->token);
+    if (oldPeer)
+      ::PostMessageW(oldPeer, kExternalRelease, reinterpret_cast<WPARAM>(hwnd),
+                     oldToken);
+    state->peer = nullptr;
+    state->pending = false;
+    state->lastAttempt = now;
+    state->attempted = true;
+  }
+  if (!state->peer) {
+    if (state->attempted &&
+        static_cast<DWORD>(now - state->lastAttempt) < kExternalRetryMs)
+      return;
+    state->lastAttempt = now;
+    state->attempted = true;
+    state->peer = FindExternalServer();
+    if (!state->peer)
+      return;
+  }
+  // The pending request reads the newest published snapshot, so keystrokes and
+  // CI #20 moves coalesce instead of queuing one geometry message per change.
+  if (ExternalLeaseReady(hwnd, state) &&
+      ExternalProperty(state->peer, kExtAckSequence) ==
+          state->snapshot.sequence)
+    return;
+  if (::PostMessageW(state->peer, kExternalUpdate,
+                     reinterpret_cast<WPARAM>(hwnd), state->token)) {
+    state->pending = true;
+    state->pendingSince = now;
+    state->pendingSequence = state->snapshot.sequence;
+  } else {
+    state->peer = nullptr;
+    state->lastAttempt = now;
+  }
+}
+
+void SyncExternalClient(HWND hwnd,
+                        HWND candidate,
+                        WeaselPanel* panel,
+                        int x,
+                        int y,
+                        int width,
+                        int height,
+                        BOOL dark) {
+  if (!hwnd || !IsExternalSettingsClient() || width <= 0 || height <= 0 ||
+      !ExternalCandidateVisible(candidate))
+    return;
+  auto state = MakeExternalState(hwnd, false);
+  if (!state)
+    return;
+  state->candidate = candidate;
+  state->panel = panel;
+  if (!state->active) {
+    state->token = NextExternalToken();
+    state->snapshot.sequence = 0;
+    state->active = true;
+    if (!::SetTimer(hwnd, kExternalTimer, 50, nullptr)) {
+      ReleaseExternalClient(hwnd);
+      return;
+    }
+  }
+  ExternalSnapshot snap;
+  snap.candidate = candidate;
+  snap.token = state->token;
+  snap.x = x;
+  snap.y = y;
+  snap.width = width;
+  snap.height = height;
+  snap.dark = dark;
+  const auto& old = state->snapshot;
+  if (!old.sequence || old.x != x || old.y != y || old.width != width ||
+      old.height != height || old.dark != dark) {
+    if (!PublishExternalSnapshot(hwnd, state, snap)) {
+      ReleaseExternalClient(hwnd);
+      return;
+    }
+  }
+  RequestExternalSnapshot(hwnd, state);
+}
+
+bool ExternalForegroundReady(HWND hwnd) {
+  const auto state = ExternalState(hwnd);
+  return state && state->foregroundReady && ExternalLeaseReady(hwnd, state);
+}
+
+void DestroyExternalState(HWND hwnd) {
+  auto state = ExternalState(hwnd);
+  if (!state)
+    return;
+  if (state->server)
+    EndExternalServerLease(hwnd, state);
+  else
+    ReleaseExternalClient(hwnd);
+  ::KillTimer(hwnd, kExternalTimer);
+  ::RemovePropW(hwnd, kExtProtocol);
+  ::RemovePropW(hwnd, kExtServer);
+  ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+  delete state;
+}
+
+bool HandleExternalAcrylicMessage(HWND hwnd,
+                                  UINT message,
+                                  WPARAM wParam,
+                                  LPARAM lParam,
+                                  LRESULT& result) {
+  auto state = ExternalState(hwnd);
+  if (!state)
+    return false;
+  result = 0;
+  if (message == WM_NCDESTROY) {
+    DestroyExternalState(hwnd);
+    return false;
+  }
+  if (message == kExternalUpdate && state->server) {
+    ApplyExternalSnapshot(hwnd, state, reinterpret_cast<HWND>(wParam),
+                          static_cast<DWORD>(lParam));
+    return true;
+  }
+  if (message == kExternalRelease && state->server) {
+    if (state->peer == reinterpret_cast<HWND>(wParam) &&
+        state->token == static_cast<DWORD>(lParam))
+      EndExternalServerLease(hwnd, state);
+    return true;
+  }
+  if (message == kExternalAck && !state->server) {
+    if (state->peer == reinterpret_cast<HWND>(wParam) &&
+        state->token == static_cast<DWORD>(lParam)) {
+      state->pending = false;
+      if (!ExternalLeaseReady(hwnd, state)) {
+        // A negative ACK must not create an immediate retry/ACK busy loop.
+        state->peer = nullptr;
+        state->lastAttempt = ::GetTickCount();
+        state->attempted = true;
+        state->token = NextExternalToken();
+        SetExternalProperty(hwnd, kExtToken, state->token);
+      }
+      RefreshExternalForeground(hwnd, state);
+      if (ExternalState(hwnd) == state)
+        RequestExternalSnapshot(hwnd, state);
+    }
+    return true;
+  }
+  if (message != WM_TIMER || wParam != kExternalTimer)
+    return false;
+  if (state->server) {
+    if (state->active) {
+      const HWND client = state->peer;
+      if (!IsExternalHostClass(client) ||
+          ExternalProperty(client, kExtToken) != state->token ||
+          ExternalProperty(client, kExtWanted) != 1 ||
+          !ExternalCandidateVisible(state->candidate) ||
+          !ExternalFresh(::GetTickCount(), static_cast<DWORD>(ExternalProperty(
+                                               client, kExtClientPulse)))) {
+        EndExternalServerLease(hwnd, state);
+      } else {
+        // Liveness only. Geometry still comes exclusively from panel snapshots.
+        SetExternalProperty(hwnd, kExtServerPulse, ::GetTickCount());
+      }
+    }
+  } else if (state->active) {
+    if (!ExternalCandidateVisible(state->candidate)) {
+      const bool wasReady = state->foregroundReady;
+      const HWND candidate = state->candidate;
+      WeaselPanel* panel = state->panel;
+      ReleaseExternalClient(hwnd);
+      // A cloaked/minimized owner can return with the same candidate HWND.
+      // Restore its backing pixels now, without reactivating the hidden lease.
+      if (wasReady && panel && ::IsWindow(candidate) &&
+          ::IsWindowVisible(candidate))
+        panel->RedrawWindow();
+    } else {
+      SetExternalProperty(hwnd, kExtClientPulse, ::GetTickCount());
+      RefreshExternalForeground(hwnd, state);
+      if (ExternalState(hwnd) == state) {
+        RequestExternalSnapshot(hwnd, state);
+        RefreshExternalForeground(hwnd, state);
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 template <class t0, class t1, class t2>
@@ -454,6 +1078,8 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     ::SetPropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty,
                reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1)));
     m_acrylicBackdropEnabled = true;
+    if (m_in_server)
+      PrepareExternalServer(m_acrylicBackdrop);
     return true;
   }
 
@@ -467,6 +1093,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   return false;
 }
 void WeaselPanel::_DestroyAcrylicBackdrop() {
+  DestroyExternalState(m_acrylicBackdrop);
   m_acrylicBackdropEnabled = false;
   if (m_acrylicBackdrop) {
     ::RemovePropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty);
@@ -488,8 +1115,9 @@ void WeaselPanel::_UpdateAcrylicBackdropTheme() {
   g_acrylicAppSdkBridge.SetDarkMode(m_acrylicBackdrop, useDarkMode);
 }
 bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
-  if (!m_acrylicBackdropEnabled || !m_acrylicBackdrop || !m_layout ||
-      hide_candidates)
+  if (!m_acrylicBackdrop || !m_layout || hide_candidates)
+    return false;
+  if (!m_acrylicBackdropEnabled && (m_in_server || !IsExternalSettingsClient()))
     return false;
 
   return ((!m_ctx.empty() && !m_style.inline_preedit) ||
@@ -516,6 +1144,17 @@ void WeaselPanel::_SyncAcrylicBackdrop() {
     return;
   }
 
+  if (!m_acrylicBackdropEnabled) {
+    // Publish the final content rectangle without waiting for another process.
+    SyncExternalClient(m_acrylicBackdrop, m_hWnd, this, x, y, width, height,
+                       IsDarkColor(m_style.back_color) ? TRUE : FALSE);
+    return;
+  }
+
+  // A genuinely visible server-side candidate takes priority over a lease.
+  // Routine Hide() calls from the server's hidden UI do not revoke the lease.
+  if (m_in_server && ExternalBorrowed(m_acrylicBackdrop))
+    EndExternalServerLease(m_acrylicBackdrop, ExternalState(m_acrylicBackdrop));
   _UpdateAcrylicBackdropTheme();
 
   // Keep the DWM Acrylic host immediately below the existing layered
@@ -529,7 +1168,9 @@ void WeaselPanel::ShowAcrylicBackdrop() {
 }
 
 void WeaselPanel::HideAcrylicBackdrop() {
-  if (m_acrylicBackdrop)
+  ReleaseExternalClient(m_acrylicBackdrop);
+  if (m_acrylicBackdrop &&
+      !(m_in_server && ExternalBorrowed(m_acrylicBackdrop)))
     ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
 }
 
@@ -1474,7 +2115,9 @@ void WeaselPanel::DoPaint(CDCHandle dc) {
       CRect backrc = m_layout->GetContentRect();
       COLORREF backColor = m_style.back_color;
       COLORREF shadowColor = m_style.shadow_color;
-      if (m_acrylicBackdropEnabled) {
+      const bool localAcrylic =
+          m_acrylicBackdropEnabled && !ExternalBorrowed(m_acrylicBackdrop);
+      if (localAcrylic || ExternalForegroundReady(m_acrylicBackdrop)) {
         if (COLORNOTTRANSPARENT(backColor))
           backColor = WithAlpha(backColor, kAcrylicTintAlpha);
         shadowColor = TRANS_COLOR;
@@ -1663,6 +2306,10 @@ void WeaselPanel::MoveTo(RECT const& rc) {
         m_layout->ShouldDisplayStatusIcon() || m_redraw_by_monitor_change)
       RedrawWindow();
   }
+  // CI #20 has already finalized the real candidate position. Only publish
+  // its content rectangle; never repeat the owner-translation calculation.
+  if (!m_in_server && !m_acrylicBackdropEnabled && IsExternalSettingsClient())
+    _SyncAcrylicBackdrop();
 }
 
 void WeaselPanel::_RepositionWindow(const bool& adj) {
