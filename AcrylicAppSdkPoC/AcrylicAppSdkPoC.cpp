@@ -57,6 +57,12 @@ HMODULE g_helperModule = nullptr;
 HMODULE g_bootstrapModule = nullptr;
 int g_modulePinAnchor = 0;
 
+// B.2e v1: do not bootstrap into a process that already has package identity.
+// Route 1 preserves the existing unpackaged path; route 2 borrows only classes
+// that Windows can activate in the host's existing runtime environment.
+LONG g_runtimeRoute = 0;  // 0 unknown, 1 explicit bootstrap, 2 host runtime
+LONG g_runtimeFailureStage = 6;
+
 BOOL CALLBACK InitializeBootstrapOnce(PINIT_ONCE, PVOID, PVOID*) noexcept {
   try {
     if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -66,6 +72,25 @@ BOOL CALLBACK InitializeBootstrapOnce(PINIT_ONCE, PVOID, PVOID*) noexcept {
       g_bootstrapResult = LastWin32Error();
       return TRUE;
     }
+
+    UINT32 packageNameLength = 0;
+    const LONG identity =
+        ::GetCurrentPackageFullName(&packageNameLength, nullptr);
+    if (identity == ERROR_INSUFFICIENT_BUFFER && packageNameLength > 0) {
+      g_runtimeRoute = 2;
+      // Classification is NOT proof of Acrylic support. Attach probes the
+      // host's activation factories on its own initialized UI thread.
+      g_bootstrapResult = S_OK;
+      return TRUE;
+    }
+    if (identity != APPMODEL_ERROR_NO_PACKAGE) {
+      g_runtimeFailureStage = 7;
+      g_bootstrapResult = identity == ERROR_SUCCESS
+                              ? E_UNEXPECTED
+                              : HRESULT_FROM_WIN32(identity);
+      return TRUE;
+    }
+    g_runtimeRoute = 1;
 
     // Resolve relative to this DLL, NEVER to WINWORD.EXE/the current directory.
     WCHAR modulePath[32768] = {};
@@ -102,7 +127,7 @@ BOOL CALLBACK InitializeBootstrapOnce(PINIT_ONCE, PVOID, PVOID*) noexcept {
     PACKAGE_VERSION minimum{};
     minimum.Version = WINDOWSAPPSDK_RUNTIME_VERSION_UINT64;
     // None: no fail-fast, debugger break, installation UI, or host restart.
-    // A packaged/incompatible host may decline this optional effect.
+    // An incompatible unpackaged host may decline this optional effect.
     g_bootstrapResult = initialize(WINDOWSAPPSDK_RELEASE_MAJORMINOR,
                                    WINDOWSAPPSDK_RELEASE_VERSION_TAG_W, minimum,
                                    MddBootstrapInitializeOptions_None);
@@ -158,6 +183,10 @@ struct ThreadState {
   bool shutdownRequested = false;
   HWND lifetimeWindow = nullptr;
   HWND legacyTarget = nullptr;
+  // Cache factory-probe failures on this UI thread, not COM objects. A missing
+  // host runtime must not be probed again on every candidate recreation.
+  LONG hostFactoryFailureStage = 0;
+  HRESULT hostFactoryFailure = S_OK;
   winrt::Windows::System::DispatcherQueueController ownedQueue{nullptr};
   winrt::Windows::Foundation::IAsyncAction shutdownAction{nullptr};
   std::map<HWND, std::unique_ptr<Target>> targets;
@@ -317,7 +346,59 @@ struct BusyScope {
   }
 };
 
-HRESULT PrepareThread(ThreadState& state) {
+// Keep host-owned factories local to Attach. No cross-thread/static factory
+// cache and no direct DllGetActivationFactory or system-package path loading.
+struct HostRuntimeFactories {
+  winrt::Windows::Foundation::IActivationFactory acrylic{nullptr};
+  winrt::Windows::Foundation::IActivationFactory configuration{nullptr};
+  winrt::Microsoft::UI::Composition::SystemBackdrops::
+      IDesktopAcrylicControllerStatics support{nullptr};
+};
+
+HRESULT ProbeHostFactories(ThreadState& state, HostRuntimeFactories& host) {
+  if (state.hostFactoryFailureStage) {
+    Diagnose(state.hostFactoryFailureStage, state.hostFactoryFailure,
+             L"Cached host factory failure; restart the host to retry.");
+    return state.hostFactoryFailure;
+  }
+  try {
+    Diagnose(8);
+    const winrt::hstring acrylicName{
+        L"Microsoft.UI.Composition.SystemBackdrops.DesktopAcrylicController"};
+    winrt::check_hresult(::RoGetActivationFactory(
+        reinterpret_cast<HSTRING>(winrt::get_abi(acrylicName)),
+        winrt::guid_of<winrt::Windows::Foundation::IActivationFactory>(),
+        winrt::put_abi(host.acrylic)));
+    if (!host.acrylic)
+      winrt::throw_hresult(E_NOINTERFACE);
+
+    Diagnose(9);
+    const winrt::hstring configurationName{
+        L"Microsoft.UI.Composition.SystemBackdrops."
+        L"SystemBackdropConfiguration"};
+    winrt::check_hresult(::RoGetActivationFactory(
+        reinterpret_cast<HSTRING>(winrt::get_abi(configurationName)),
+        winrt::guid_of<winrt::Windows::Foundation::IActivationFactory>(),
+        winrt::put_abi(host.configuration)));
+    if (!host.configuration)
+      winrt::throw_hresult(E_NOINTERFACE);
+
+    Diagnose(12);
+    host.support =
+        host.acrylic.as<winrt::Microsoft::UI::Composition::SystemBackdrops::
+                            IDesktopAcrylicControllerStatics>();
+    return S_OK;
+  } catch (winrt::hresult_error const& error) {
+    Diagnose(t_lastStage, error.code(), error.message().c_str());
+  } catch (...) {
+    Diagnose(t_lastStage, E_UNEXPECTED);
+  }
+  state.hostFactoryFailureStage = t_lastStage;
+  state.hostFactoryFailure = t_lastHresult;
+  return t_lastHresult;
+}
+
+HRESULT PrepareThread(ThreadState& state, HostRuntimeFactories& host) {
   if (!state.roOwned) {
     const HRESULT hr = ::RoInitialize(RO_INIT_SINGLETHREADED);
     if (FAILED(hr))
@@ -328,8 +409,16 @@ HRESULT PrepareThread(ThreadState& state) {
   if (!::InitOnceExecuteOnce(&g_bootstrapOnce, InitializeBootstrapOnce, nullptr,
                              nullptr))
     return LastWin32Error();
-  if (FAILED(g_bootstrapResult))
+  if (FAILED(g_bootstrapResult)) {
+    Diagnose(g_runtimeFailureStage, g_bootstrapResult);
     return g_bootstrapResult;
+  }
+  if (g_runtimeRoute == 2) {
+    const HRESULT probe = ProbeHostFactories(state, host);
+    if (FAILED(probe))
+      return probe;
+    Diagnose(13);  // host factories passed; now prepare lifetime bookkeeping
+  }
   return EnsureLifetimeWindow(state);
 }
 
@@ -367,6 +456,9 @@ WeaselAcrylicAppSdkAttach(HWND hwnd, BOOL darkMode) {
     Diagnose(1, valid);
     return FALSE;
   }
+  // Read-only observers can distinguish this helper from the CI #18 build.
+  ::SetPropW(hwnd, L"WeaselAcrylicHostProbeVersion",
+             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(1)));
   if (!t_state)
     t_state = new (std::nothrow) ThreadState;
   if (!t_state) {
@@ -388,14 +480,21 @@ WeaselAcrylicAppSdkAttach(HWND hwnd, BOOL darkMode) {
       return TRUE;
     }
     Diagnose(5);
-    const HRESULT prepared = PrepareThread(state);
+    HostRuntimeFactories hostFactories;
+    const HRESULT prepared = PrepareThread(state, hostFactories);
+    ::SetPropW(
+        hwnd, L"WeaselAcrylicRuntimeRoute",
+        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(g_runtimeRoute)));
     if (FAILED(prepared)) {
       Diagnose(t_lastStage, prepared);
       return FALSE;
     }
-    Diagnose(10);
     using namespace winrt::Microsoft::UI::Composition::SystemBackdrops;
-    if (!DesktopAcrylicController::IsSupported()) {
+    Diagnose(10);
+    const bool supported = g_runtimeRoute == 2
+                               ? hostFactories.support.IsSupported()
+                               : DesktopAcrylicController::IsSupported();
+    if (!supported) {
       Diagnose(10, HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
       return FALSE;
     }
@@ -429,13 +528,25 @@ WeaselAcrylicAppSdkAttach(HWND hwnd, BOOL darkMode) {
     target->root.RelativeSizeAdjustment({1.0f, 1.0f});
     target->desktop.Root(target->root);
     Diagnose(70);
-    target->configuration = SystemBackdropConfiguration();
+    target->configuration =
+        g_runtimeRoute == 2
+            ? hostFactories.configuration
+                  .ActivateInstance<SystemBackdropConfiguration>()
+            : SystemBackdropConfiguration();
+    // ActivateInstance<T> may return null when the default interface is absent.
+    if (!target->configuration)
+      winrt::throw_hresult(E_NOINTERFACE);
     target->configuration.IsInputActive(true);
     target->configuration.Theme(darkMode ? SystemBackdropTheme::Dark
                                          : SystemBackdropTheme::Light);
     target->dark = darkMode;
     Diagnose(80);
-    target->acrylic = DesktopAcrylicController();
+    target->acrylic =
+        g_runtimeRoute == 2
+            ? hostFactories.acrylic.ActivateInstance<DesktopAcrylicController>()
+            : DesktopAcrylicController();
+    if (!target->acrylic)
+      winrt::throw_hresult(E_NOINTERFACE);
     target->acrylic.Kind(DesktopAcrylicKind::Base);
     target->acrylic.SetSystemBackdropConfiguration(target->configuration);
     Diagnose(90);
