@@ -8,6 +8,7 @@
 #include <dwrite_2.h>
 #include <memory>
 #include <functional>
+#include <utility>
 #include <WeaselUtility.h>
 
 namespace weasel {
@@ -68,6 +69,15 @@ class UI {
   bool GetIsReposition();
   bool& InServer() { return in_server_; }
 
+  using AcrylicServerQuery =
+      std::function<bool(DWORD&, DWORD&, DWORD&, DWORD&)>;
+  void SetAcrylicServerQuery(AcrylicServerQuery query) {
+    acrylicServerQuery_ = std::move(query);
+  }
+  const AcrylicServerQuery& acrylicServerQuery() const {
+    return acrylicServerQuery_;
+  }
+
   std::function<void(size_t* const, size_t* const, bool* const, bool* const)>&
   uiCallback() {
     return _UICallback;
@@ -89,6 +99,7 @@ class UI {
   UIStyle style_;
   UIStyle ostyle_;
   bool in_server_;
+  AcrylicServerQuery acrylicServerQuery_;
   std::function<void(size_t* const, size_t* const, bool* const, bool* const)>
       _UICallback;
 };

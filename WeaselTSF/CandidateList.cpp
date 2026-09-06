@@ -114,9 +114,15 @@ CCandidateList::CCandidateList(com_ptr<WeaselTSF> pTextService)
       _tsf(pTextService),
       _pbShow(TRUE) {
   _cRef = 1;
+  _ui->SetAcrylicServerQuery(
+      [this](DWORD& processId, DWORD& sessionId, DWORD& stage, DWORD& error) {
+        return _tsf->QueryAcrylicServer(processId, sessionId, stage, error);
+      });
 }
 
 CCandidateList::~CCandidateList() {
+  // _tsf is destroyed before _ui; do not retain a callback to this object.
+  _ui->SetAcrylicServerQuery({});
   UpdateAcrylicUiProbe(this, 3, S_OK, _pbShow);
   _StopOwnerFollow(true);
 }

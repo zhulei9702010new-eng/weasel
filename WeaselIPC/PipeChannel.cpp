@@ -24,6 +24,66 @@ PipeChannelBase::~PipeChannelBase() {
   // Thread-specific pointers are cleaned up automatically
 }
 
+bool PipeChannelBase::QueryServerIdentity(DWORD& processId,
+                                          DWORD& sessionId,
+                                          DWORD& stage,
+                                          DWORD& error) const {
+  // Preserve the caller's last-error state; diagnostics are explicit outputs.
+  const DWORD savedError = ::GetLastError();
+  struct LastErrorScope {
+    DWORD value;
+    ~LastErrorScope() { ::SetLastError(value); }
+  } restore{savedError};
+  processId = 0;
+  sessionId = 0;
+  stage = 1;
+  error = ERROR_PIPE_NOT_CONNECTED;
+  const HANDLE* pipe = hpipe_ptr.get();
+  if (!pipe || !*pipe || _Invalid(*pipe))
+    return false;
+
+  // This pipe is thread-local and is not being read by a second thread.
+  // Peek consumes no response bytes and sends no request to the server.
+  stage = 2;
+  if (!::PeekNamedPipe(*pipe, nullptr, 0, nullptr, nullptr, nullptr)) {
+    error = ::GetLastError();
+    return false;
+  }
+  ULONG peerPid = 0;
+  ULONG peerSession = 0;
+  stage = 3;
+  if (!::GetNamedPipeServerProcessId(*pipe, &peerPid)) {
+    error = ::GetLastError();
+    return false;
+  }
+  stage = 4;
+  if (!::GetNamedPipeServerSessionId(*pipe, &peerSession)) {
+    error = ::GetLastError();
+    return false;
+  }
+  stage = 5;
+  if (!peerPid || peerPid == ::GetCurrentProcessId()) {
+    error = ERROR_INVALID_DATA;
+    return false;
+  }
+  DWORD ourSession = 0;
+  stage = 6;
+  if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &ourSession)) {
+    error = ::GetLastError();
+    return false;
+  }
+  stage = 7;
+  if (peerSession != ourSession) {
+    error = ERROR_ACCESS_DENIED;
+    return false;
+  }
+  processId = peerPid;
+  sessionId = peerSession;
+  stage = 100;
+  error = ERROR_SUCCESS;
+  return true;
+}
+
 bool PipeChannelBase::_Ensure() {
   try {
     HANDLE* phandle = _GetPipeHandle();

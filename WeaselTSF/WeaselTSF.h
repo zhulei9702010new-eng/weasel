@@ -22,6 +22,14 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   WeaselTSF();
   ~WeaselTSF();
 
+  // The UI may inspect, but never reconnect or send through, the active pipe.
+  bool QueryAcrylicServer(DWORD& processId,
+                          DWORD& sessionId,
+                          DWORD& stage,
+                          DWORD& error) const {
+    return m_client.QueryConnectedServer(processId, sessionId, stage, error);
+  }
+
   /* IUnknown */
   STDMETHODIMP QueryInterface(REFIID riid, void** ppvObject);
   STDMETHODIMP_(ULONG) AddRef();

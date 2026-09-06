@@ -67,6 +67,17 @@ class WeaselPanel
   void RedrawWindow();
   void ShowAcrylicBackdrop();
   void HideAcrylicBackdrop();
+  bool QueryAcrylicServer(DWORD& processId,
+                          DWORD& sessionId,
+                          DWORD& stage,
+                          DWORD& error) const {
+    processId = 0;
+    sessionId = 0;
+    stage = 11;  // No TSF pipe query callback installed.
+    error = ERROR_NOT_SUPPORTED;
+    return m_acrylicServerQuery &&
+           m_acrylicServerQuery(processId, sessionId, stage, error);
+  }
 
   static VOID CALLBACK OnTimer(_In_ HWND hwnd,
                                _In_ UINT uMsg,
@@ -118,6 +129,7 @@ class WeaselPanel
   weasel::UIStyle& m_style;
   weasel::UIStyle& m_ostyle;
   const bool& m_in_server;
+  const weasel::UI::AcrylicServerQuery& m_acrylicServerQuery;
 
   CRect m_inputPos;
   int m_offsetys[MAX_CANDIDATES_COUNT];  // offset y for candidates when

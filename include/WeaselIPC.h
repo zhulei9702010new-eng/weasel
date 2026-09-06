@@ -124,6 +124,12 @@ class Client {
   void EndMaintenance();
   // 测试连接
   bool Echo();
+  // Query the existing input session's pipe peer without sending or
+  // reconnecting.
+  bool QueryConnectedServer(DWORD& processId,
+                            DWORD& sessionId,
+                            DWORD& stage,
+                            DWORD& error) const;
   // 请求服务处理按键消息
   bool ProcessKeyEvent(KeyEvent const& keyEvent);
   // 上屏正在編輯的文字

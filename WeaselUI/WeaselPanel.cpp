@@ -587,6 +587,7 @@ struct ExternalAcrylicState {
   DWORD lastAttempt = 0;
   DWORD pendingSince = 0;
   DWORD pendingSequence = 0;
+  DWORD boundServerPid = 0;  // Derived locally from the connected input pipe.
 };
 
 ULONG_PTR ExternalProperty(HWND hwnd, const wchar_t* name) {
@@ -917,9 +918,43 @@ bool ExternalServerAvailable(HWND hwnd) {
 
 bool ExternalCoordinatorOnly();
 
+// R2 binds restricted Search/Store clients to their existing input pipe peer.
+// This inherits the trust of that input connection; a PID is not a signature.
+// The candidate-side route must not OpenProcess/OpenProcessToken on the server.
+constexpr wchar_t kExtIdentityRoute[] = L"WeaselAcrylicServerIdentityRoute";
+constexpr wchar_t kExtPipeStage[] = L"WeaselAcrylicPipeStage";
+constexpr wchar_t kExtPipeError[] = L"WeaselAcrylicPipeError";
+constexpr wchar_t kExtPipePid[] = L"WeaselAcrylicPipeServerPid";
+constexpr wchar_t kExtPipeSession[] = L"WeaselAcrylicPipeServerSession";
+constexpr wchar_t kExtBoundPid[] = L"WeaselAcrylicBoundServerPid";
+
+bool QueryExternalPipeServer(HWND client,
+                             ExternalAcrylicState* state,
+                             DWORD& processId) {
+  processId = 0;
+  DWORD sessionId = 0;
+  DWORD stage = 11;
+  DWORD error = ERROR_NOT_SUPPORTED;
+  const bool ok =
+      state && state->panel &&
+      state->panel->QueryAcrylicServer(processId, sessionId, stage, error);
+  SetExternalProperty(client, kExtIdentityRoute, 2);
+  SetExternalProperty(client, kExtPipeStage, stage);
+  SetExternalProperty(client, kExtPipeError, error);
+  SetExternalProperty(client, kExtPipePid, ok ? processId : 0);
+  SetExternalProperty(client, kExtPipeSession, ok ? sessionId : 0);
+  if (!ok || !processId) {
+    processId = 0;
+    return false;
+  }
+  return true;
+}
+
 struct ExternalServerSearch {
   HWND window = nullptr;
-  DWORD stage = 1;  // 1 no advertised server; 2 policy; 3 filter; 4 identity.
+  DWORD stage = 1;  // 1 no server; 2 policy; 3 filter; 4 legacy identity.
+  DWORD pipePid = 0;
+  bool pipeBound = false;  // 5 pipe query failed; 6 HWND PID differs from pipe.
 };
 
 BOOL CALLBACK FindExternalServerCallback(HWND hwnd, LPARAM parameter) {
@@ -939,7 +974,12 @@ BOOL CALLBACK FindExternalServerCallback(HWND hwnd, LPARAM parameter) {
   }
   DWORD pid = 0;
   ::GetWindowThreadProcessId(hwnd, &pid);
-  if (!ExternalProcessMatches(pid, false)) {
+  if (search->pipeBound) {
+    if (!pid || pid != search->pipePid) {
+      search->stage = 6;
+      return TRUE;
+    }
+  } else if (!ExternalProcessMatches(pid, false)) {
     search->stage = 4;
     return TRUE;
   }
@@ -950,7 +990,21 @@ BOOL CALLBACK FindExternalServerCallback(HWND hwnd, LPARAM parameter) {
 
 HWND FindExternalServer(HWND client) {
   ExternalServerSearch search;
+  auto state = ExternalState(client);
+  search.pipeBound = ExternalCoordinatorOnly();
+  if (search.pipeBound) {
+    if (!QueryExternalPipeServer(client, state, search.pipePid)) {
+      SetExternalProperty(client, L"WeaselAcrylicExternalDiscovery", 5);
+      return nullptr;  // No fallback to class-name or unverified PID discovery.
+    }
+  } else {
+    SetExternalProperty(client, kExtIdentityRoute, 1);
+  }
   ::EnumWindows(FindExternalServerCallback, reinterpret_cast<LPARAM>(&search));
+  if (state) {
+    state->boundServerPid = search.window ? search.pipePid : 0;
+    SetExternalProperty(client, kExtBoundPid, state->boundServerPid);
+  }
   SetExternalProperty(client, L"WeaselAcrylicExternalDiscovery", search.stage);
   return search.window;
 }
@@ -1175,6 +1229,8 @@ void ReleaseExternalClient(HWND hwnd) {
   state->attempted = false;
   state->peer = nullptr;
   state->token = 0;
+  state->boundServerPid = 0;
+  SetExternalProperty(hwnd, kExtBoundPid, 0);
 }
 
 DWORD NextExternalToken() {
@@ -1210,10 +1266,40 @@ bool PublishExternalSnapshot(HWND hwnd,
   return true;
 }
 
+// A pipe reconnection/server restart invalidates the lease before new requests.
+// The callback reads the current TLS handle, not the handle from first attach.
+bool ExternalPipePeerCurrent(HWND hwnd, ExternalAcrylicState* state) {
+  if (!ExternalCoordinatorOnly())
+    return true;
+  DWORD pipePid = 0;
+  const bool queried = QueryExternalPipeServer(hwnd, state, pipePid);
+  DWORD windowPid = 0;
+  if (state->peer)
+    ::GetWindowThreadProcessId(state->peer, &windowPid);
+  if (queried && pipePid == state->boundServerPid && windowPid == pipePid)
+    return true;
+
+  SetExternalProperty(hwnd, L"WeaselAcrylicExternalDiscovery", queried ? 6 : 5);
+  // Release is asynchronous, and only affects this HWND/token on the server.
+  if (state->peer)
+    ::PostMessageW(state->peer, kExternalRelease,
+                   reinterpret_cast<WPARAM>(hwnd), state->token);
+  state->token = NextExternalToken();
+  SetExternalProperty(hwnd, kExtToken, state->token);
+  state->peer = nullptr;
+  state->pending = false;
+  state->boundServerPid = 0;
+  SetExternalProperty(hwnd, kExtBoundPid, 0);
+  state->attempted = false;
+  return false;
+}
+
 void RequestExternalSnapshot(HWND hwnd, ExternalAcrylicState* state) {
   if (!state || state->server || !state->active)
     return;
   const DWORD now = ::GetTickCount();
+  if (state->peer)
+    ExternalPipePeerCurrent(hwnd, state);
   if (state->peer && !ExternalServerAvailable(state->peer)) {
     state->peer = nullptr;
     state->pending = false;
@@ -1495,6 +1581,7 @@ WeaselPanel::WeaselPanel(weasel::UI& ui)
       m_octx(ui.octx()),
       m_status(ui.status()),
       m_in_server(ui.InServer()),
+      m_acrylicServerQuery(ui.acrylicServerQuery()),
       m_style(ui.style()),
       m_ostyle(ui.ostyle()),
       m_candidateCount(0),

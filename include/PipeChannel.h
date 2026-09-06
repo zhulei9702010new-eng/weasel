@@ -24,6 +24,13 @@ class PipeChannelBase {
   PipeChannelBase(std::wstring&& pn_cmd, size_t bs, SECURITY_ATTRIBUTES* s);
   ~PipeChannelBase();
 
+  // Metadata of this thread's already connected pipe. Never connect or
+  // transact.
+  bool QueryServerIdentity(DWORD& processId,
+                           DWORD& sessionId,
+                           DWORD& stage,
+                           DWORD& error) const;
+
  protected:
   /* To ensure connection before operation */
   bool _Ensure();
