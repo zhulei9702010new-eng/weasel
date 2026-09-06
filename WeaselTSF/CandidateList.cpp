@@ -4,6 +4,7 @@
 #include "CandidateList.h"
 #include <KeyEvent.h>
 #include <math.h>
+#include <appmodel.h>
 
 using namespace std;
 using namespace weasel;
@@ -12,6 +13,99 @@ namespace {
 constexpr wchar_t kOwnerFollowClass[] = L"WeaselSettingsOwnerFollowV1";
 constexpr UINT_PTR kOwnerFollowTimer = 0x5746;
 constexpr UINT kOwnerFollowIntervalMs = 33;
+// Phase2 R1: metadata only. Never override BeginUIElement's show decision.
+// SearchHost is not fully covered by EnumWindows on Windows 8+; an explicit
+// message-only probe lets the observer distinguish host-drawn UI from a TIP
+// window that was missed by top-level enumeration.
+constexpr wchar_t kAcrylicUiProbeClass[] = L"WeaselAcrylicUiProbe";
+
+bool AcrylicSearchUiProbeEnabled() {
+  static const bool enabled = []() {
+    wchar_t path[32768] = {};
+    const DWORD length = ::GetModuleFileNameW(nullptr, path, _countof(path));
+    if (!length || length >= _countof(path))
+      return false;
+    const std::wstring image(path, length);
+    const auto slash = image.find_last_of(L"\\/");
+    if (slash == std::wstring::npos ||
+        ::lstrcmpiW(image.c_str() + slash + 1, L"SearchHost.exe") != 0)
+      return false;
+    wchar_t family[256] = {};
+    UINT32 count = _countof(family);
+    return ::GetPackageFamilyName(::GetCurrentProcess(), &count, family) ==
+               ERROR_SUCCESS &&
+           ::lstrcmpW(family, L"MicrosoftWindows.Client.CBS_cw5n1h2txyewy") ==
+               0;
+  }();
+  return enabled;
+}
+
+LRESULT CALLBACK AcrylicUiProbeProc(HWND hwnd,
+                                    UINT message,
+                                    WPARAM wp,
+                                    LPARAM lp) {
+  return ::DefWindowProcW(hwnd, message, wp, lp);
+}
+
+void UpdateAcrylicUiProbe(const void* instance,
+                          DWORD stage,
+                          HRESULT hr,
+                          BOOL show) {
+  if (!AcrylicSearchUiProbeEnabled())
+    return;
+  struct Probe {
+    HWND window = nullptr;
+    const void* instance = nullptr;  // Not published outside this thread.
+  };
+  static thread_local Probe probe;
+  if (stage == 1)
+    probe.instance = instance;
+  if (probe.instance != instance)
+    return;
+  if (!::IsWindow(probe.window)) {
+    HMODULE module = nullptr;
+    static int anchor = 0;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_PIN,
+                              reinterpret_cast<LPCWSTR>(&anchor), &module))
+      return;
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = module;
+    wc.lpfnWndProc = AcrylicUiProbeProc;
+    wc.lpszClassName = kAcrylicUiProbeClass;
+    if (!::RegisterClassExW(&wc)) {
+      WNDCLASSEXW existing = {};
+      existing.cbSize = sizeof(existing);
+      if (::GetLastError() != ERROR_CLASS_ALREADY_EXISTS ||
+          !::GetClassInfoExW(module, kAcrylicUiProbeClass, &existing) ||
+          existing.lpfnWndProc != AcrylicUiProbeProc)
+        return;
+    }
+    // Windows destroys this thread-owned HWND on thread exit. Keeping one
+    // per UI thread avoids changing COM object or candidate lifetimes.
+    probe.window = ::CreateWindowExW(0, kAcrylicUiProbeClass, L"", 0, 0, 0, 0,
+                                     0, HWND_MESSAGE, nullptr, module, nullptr);
+  }
+  if (!probe.window)
+    return;
+  ::SetPropW(probe.window, L"WeaselAcrylicUiProbeVersion",
+             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(1)));
+  ::SetPropW(probe.window, L"WeaselAcrylicUiProbeStage",
+             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(stage)));
+  ::SetPropW(
+      probe.window, L"WeaselAcrylicUiProbeHresult",
+      reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(static_cast<DWORD>(hr))));
+  const DWORD policy = (stage == 1 || FAILED(hr)) ? 0 : (show ? 1 : 2);
+  ::SetPropW(probe.window, L"WeaselAcrylicUiShowPolicy",
+             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(policy)));
+  ::SetPropW(
+      probe.window, L"WeaselAcrylicUiProbePulse",
+      reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(::GetTickCount())));
+  if (stage == 3)
+    probe.instance = nullptr;
+}
+
 }  // namespace
 
 CCandidateList::CCandidateList(com_ptr<WeaselTSF> pTextService)
@@ -23,6 +117,7 @@ CCandidateList::CCandidateList(com_ptr<WeaselTSF> pTextService)
 }
 
 CCandidateList::~CCandidateList() {
+  UpdateAcrylicUiProbe(this, 3, S_OK, _pbShow);
   _StopOwnerFollow(true);
 }
 
@@ -318,6 +413,7 @@ HRESULT CCandidateList::_UpdateUIElement() {
 void CCandidateList::StartUI() {
   if (_uiStarted)
     return;
+  UpdateAcrylicUiProbe(this, 1, S_OK, _pbShow);
 
   com_ptr<ITfThreadMgr> pThreadMgr = _tsf->_GetThreadMgr();
   if (!pThreadMgr) {
@@ -338,7 +434,9 @@ void CCandidateList::StartUI() {
                               bool* const next, bool* const scroll_next) {
       _tsf->HandleUICallback(sel, hov, next, scroll_next);
     });
-  if (FAILED(pUIElementMgr->BeginUIElement(this, &_pbShow, &uiid)))
+  const HRESULT beginHr = pUIElementMgr->BeginUIElement(this, &_pbShow, &uiid);
+  UpdateAcrylicUiProbe(this, 2, beginHr, _pbShow);
+  if (FAILED(beginHr))
     return;
   _uiStarted = true;
   // pUIElementMgr->UpdateUIElement(uiid);
@@ -362,6 +460,7 @@ void CCandidateList::EndUI() {
       emgr->EndUIElement(uiid);
   }
   _uiStarted = false;
+  UpdateAcrylicUiProbe(this, 3, S_OK, _pbShow);
   _DisposeUIWindow();
 }
 

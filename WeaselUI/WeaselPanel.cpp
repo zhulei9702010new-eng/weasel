@@ -5,6 +5,7 @@
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
 #include <commctrl.h>
+#include <appmodel.h>
 #include <string>
 #include <atomic>
 #include <new>
@@ -529,7 +530,7 @@ class AcrylicAppSdkBridge {
 
 AcrylicAppSdkBridge g_acrylicAppSdkBridge;
 
-// B.2f v2b: optional, asynchronous Settings -> WeaselServer backdrop lease.
+// Phase2 R1: optional asynchronous compatible-client -> WeaselServer lease.
 // Only HWNDs and integer tokens cross processes. The client publishes the final
 // content rectangle; the server never calculates a second caret/owner offset.
 constexpr UINT kExternalUpdate = WM_APP + 0x51A;
@@ -618,20 +619,147 @@ bool IsSettingsImage(const wchar_t* path, DWORD length) {
              static_cast<int>(expected.size()), TRUE) == CSTR_EQUAL;
 }
 
-bool IsExternalSettingsClient() {
+// Phase2 R1: one policy for the local client and server-side validation.
+// Package identity is queried from the process token, never from a window
+// property, parent-process snapshot, or an executable name on its own.
+enum class ExternalClientKind : DWORD {
+  None = 0,
+  Settings = 1,
+  Store = 2,
+  Outlook = 3,
+  Search = 4
+};
+constexpr wchar_t kExtCompatibility[] = L"WeaselAcrylicCompatibilityPolicy";
+constexpr wchar_t kExtClientKind[] = L"WeaselAcrylicClientKind";
+constexpr wchar_t kExtCoordinator[] = L"WeaselAcrylicCoordinatorHwnd";
+constexpr wchar_t kExtLowMessages[] = L"WeaselAcrylicExternalLowMessages";
+constexpr wchar_t kExtFilterError[] = L"WeaselAcrylicExternalFilterError";
+constexpr wchar_t kExtPostError[] = L"WeaselAcrylicExternalPostError";
+constexpr wchar_t kExtCreateStage[] = L"WeaselAcrylicCreateStage";
+constexpr wchar_t kExtCreateHr[] = L"WeaselAcrylicCreateHresult";
+constexpr wchar_t kExtPlacementError[] = L"WeaselAcrylicExternalPlacementError";
+
+bool ExternalPathEquals(const std::wstring& left, const std::wstring& right) {
+  return ::CompareStringOrdinal(left.c_str(), static_cast<int>(left.size()),
+                                right.c_str(), static_cast<int>(right.size()),
+                                TRUE) == CSTR_EQUAL;
+}
+
+bool ExternalImagePath(HANDLE process, std::wstring& path) {
+  wchar_t buffer[32768] = {};
+  DWORD count = _countof(buffer);
+  if (!::QueryFullProcessImageNameW(process, 0, buffer, &count) || !count ||
+      count >= _countof(buffer))
+    return false;
+  path.assign(buffer, count);
+  return true;
+}
+
+bool ExternalPackageFamily(HANDLE process, std::wstring& family) {
+  wchar_t buffer[256] = {};
+  UINT32 count = _countof(buffer);
+  if (::GetPackageFamilyName(process, &count, buffer) != ERROR_SUCCESS ||
+      !count || count > _countof(buffer))
+    return false;
+  family.assign(buffer);
+  return !family.empty();
+}
+
+bool ExternalImageInPackage(HANDLE process,
+                            const std::wstring& path,
+                            const wchar_t* executable) {
+  wchar_t package[256] = {};
+  UINT32 count = _countof(package);
+  if (::GetPackageFullName(process, &count, package) != ERROR_SUCCESS)
+    return false;
+  wchar_t directory[32768] = {};
+  count = _countof(directory);
+  if (::GetPackagePathByFullName(package, &count, directory) != ERROR_SUCCESS ||
+      !count || count > _countof(directory))
+    return false;
+  return ExternalPathEquals(path, std::wstring(directory) + L"\\" + executable);
+}
+
+ExternalClientKind ExternalKindForProcess(HANDLE process) {
+  std::wstring path;
+  if (!ExternalImagePath(process, path))
+    return ExternalClientKind::None;
+  if (IsSettingsImage(path.c_str(), static_cast<DWORD>(path.size())))
+    return ExternalClientKind::Settings;
+  std::wstring family;
+  if (!ExternalPackageFamily(process, family))
+    return ExternalClientKind::None;
+  if (family == L"Microsoft.WindowsStore_8wekyb3d8bbwe" &&
+      ExternalImageInPackage(process, path, L"WinStore.App.exe"))
+    return ExternalClientKind::Store;
+  if (family == L"Microsoft.OutlookForWindows_8wekyb3d8bbwe") {
+    if (ExternalImageInPackage(process, path, L"olk.exe"))
+      return ExternalClientKind::Outlook;
+    const auto slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos &&
+        ExternalPathEquals(path.substr(slash + 1), L"msedgewebview2.exe"))
+      return ExternalClientKind::Outlook;
+    // WebView2 is outside the package directory. Its real HWND owner is also
+    // checked against the installed olk.exe before a new lease is accepted.
+  }
+  if (family == L"MicrosoftWindows.Client.CBS_cw5n1h2txyewy" &&
+      ExternalImageInPackage(process, path, L"SearchHost.exe"))
+    return ExternalClientKind::Search;
+  return ExternalClientKind::None;
+}
+
+ExternalClientKind CurrentExternalKind() {
 #if defined(_M_X64) && !defined(_M_ARM64EC)
-  static const bool settings = []() {
-    wchar_t path[32768] = {};
-    const DWORD count = ::GetModuleFileNameW(nullptr, path, _countof(path));
-    return count && count < _countof(path) && IsSettingsImage(path, count);
-  }();
-  return settings;
+  static const ExternalClientKind kind =
+      ExternalKindForProcess(::GetCurrentProcess());
+  return kind;
 #else
-  return false;
+  return ExternalClientKind::None;
 #endif
 }
 
-bool ExternalProcessMatches(DWORD pid, bool settings) {
+bool IsExternalCompatibleClient() {
+  return CurrentExternalKind() != ExternalClientKind::None;
+}
+
+bool ExternalAppContainer(HANDLE process, bool& appContainer) {
+  HANDLE token = nullptr;
+  if (!::OpenProcessToken(process, TOKEN_QUERY, &token))
+    return false;
+  DWORD value = 0;
+  DWORD bytes = 0;
+  const BOOL ok = ::GetTokenInformation(token, TokenIsAppContainer, &value,
+                                        sizeof(value), &bytes);
+  ::CloseHandle(token);
+  if (!ok)
+    return false;
+  appContainer = value != 0;
+  return true;
+}
+
+bool ExternalSameUser(HANDLE process) {
+  HANDLE ours = nullptr;
+  HANDLE theirs = nullptr;
+  if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &ours))
+    return false;
+  if (!::OpenProcessToken(process, TOKEN_QUERY, &theirs)) {
+    ::CloseHandle(ours);
+    return false;
+  }
+  alignas(TOKEN_USER) BYTE a[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE] = {};
+  alignas(TOKEN_USER) BYTE b[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE] = {};
+  DWORD bytes = 0;
+  const bool same =
+      ::GetTokenInformation(ours, TokenUser, a, sizeof(a), &bytes) &&
+      ::GetTokenInformation(theirs, TokenUser, b, sizeof(b), &bytes) &&
+      ::EqualSid(reinterpret_cast<TOKEN_USER*>(a)->User.Sid,
+                 reinterpret_cast<TOKEN_USER*>(b)->User.Sid);
+  ::CloseHandle(theirs);
+  ::CloseHandle(ours);
+  return same;
+}
+
+bool ExternalProcessMatches(DWORD pid, bool client) {
   DWORD currentSession = 0;
   DWORD otherSession = 0;
   if (!pid || pid == ::GetCurrentProcessId() ||
@@ -642,21 +770,119 @@ bool ExternalProcessMatches(DWORD pid, bool settings) {
   HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
   if (!process)
     return false;
-  wchar_t path[32768] = {};
-  DWORD count = _countof(path);
-  const BOOL queried = ::QueryFullProcessImageNameW(process, 0, path, &count);
+  bool matches = false;
+  if (ExternalSameUser(process)) {
+    if (client) {
+      matches = ExternalKindForProcess(process) != ExternalClientKind::None;
+    } else {
+      std::wstring path;
+      std::wstring root;
+      matches = ExternalImagePath(process, path) &&
+                SUCCEEDED(ReadAcrylicInstallRoot(root)) &&
+                ExternalPathEquals(path, root + L"\\WeaselServer.exe");
+    }
+  }
   ::CloseHandle(process);
-  if (!queried || !count)
+  return matches;
+}
+
+bool ExternalMediumServer() {
+  HANDLE token = nullptr;
+  if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
     return false;
-  if (settings)
-    return IsSettingsImage(path, count);
-  std::wstring root;
-  if (FAILED(ReadAcrylicInstallRoot(root)))
+  alignas(TOKEN_MANDATORY_LABEL)
+      BYTE buffer[sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_MAX_SID_SIZE] = {};
+  DWORD bytes = 0;
+  bool allowed = false;
+  if (::GetTokenInformation(token, TokenIntegrityLevel, buffer, sizeof(buffer),
+                            &bytes)) {
+    const PSID sid =
+        reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer)->Label.Sid;
+    const UCHAR count = *::GetSidSubAuthorityCount(sid);
+    allowed = count && *::GetSidSubAuthority(sid, count - 1) ==
+                           SECURITY_MANDATORY_MEDIUM_RID;
+  }
+  ::CloseHandle(token);
+  return allowed;
+}
+
+void PrepareExternalLowMessages(HWND hwnd) {
+  // Only this renderer HWND and two integer/handle-only protocol messages.
+  // Never change process-wide filters, UIAccess, UAC, or another app's token.
+  DWORD error = ERROR_ACCESS_DENIED;
+  bool allowed = false;
+  if (ExternalMediumServer()) {
+    if (::ChangeWindowMessageFilterEx(hwnd, kExternalUpdate, MSGFLT_ALLOW,
+                                      nullptr)) {
+      if (::ChangeWindowMessageFilterEx(hwnd, kExternalRelease, MSGFLT_ALLOW,
+                                        nullptr)) {
+        allowed = true;
+        error = ERROR_SUCCESS;
+      } else {
+        error = ::GetLastError();
+        ::ChangeWindowMessageFilterEx(hwnd, kExternalUpdate, MSGFLT_RESET,
+                                      nullptr);
+      }
+    } else {
+      error = ::GetLastError();
+    }
+  }
+  SetExternalProperty(hwnd, kExtLowMessages, allowed ? 1 : 0);
+  SetExternalProperty(hwnd, kExtFilterError, error);
+}
+
+bool ExternalNewClientGeometry(HWND client, const ExternalSnapshot& snap) {
+  DWORD clientPid = 0;
+  DWORD candidatePid = 0;
+  const DWORD clientThread = ::GetWindowThreadProcessId(client, &clientPid);
+  const DWORD candidateThread =
+      ::GetWindowThreadProcessId(snap.candidate, &candidatePid);
+  if (!clientThread || clientThread != candidateThread ||
+      clientPid != candidatePid)
     return false;
-  const std::wstring expected = root + L"\\WeaselServer.exe";
-  return ::CompareStringOrdinal(path, static_cast<int>(count), expected.c_str(),
-                                static_cast<int>(expected.size()),
-                                TRUE) == CSTR_EQUAL;
+  const auto exStyle = ::GetWindowLongPtrW(snap.candidate, GWL_EXSTYLE);
+  if (!(exStyle & WS_EX_LAYERED) || !(exStyle & WS_EX_NOACTIVATE))
+    return false;
+  RECT rect = {};
+  if (!::GetWindowRect(snap.candidate, &rect) || snap.x < rect.left ||
+      snap.y < rect.top ||
+      static_cast<LONGLONG>(snap.x) + snap.width > rect.right ||
+      static_cast<LONGLONG>(snap.y) + snap.height > rect.bottom)
+    return false;
+  return true;
+}
+
+bool ExternalClientOwnerMatches(HWND client, HWND candidate) {
+  DWORD clientPid = 0;
+  ::GetWindowThreadProcessId(client, &clientPid);
+  // Outlook WebView2's executable path alone is not a sufficient identity.
+  HANDLE process =
+      ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, clientPid);
+  if (!process)
+    return false;
+  const auto kind = ExternalKindForProcess(process);
+  ::CloseHandle(process);
+  if (kind == ExternalClientKind::None)
+    return false;
+  if (kind != ExternalClientKind::Outlook)
+    return true;
+  const HWND owner = ::GetWindow(candidate, GW_OWNER);
+  if (!owner)
+    return false;
+  DWORD ownerPid = 0;
+  ::GetWindowThreadProcessId(::GetAncestor(owner, GA_ROOT), &ownerPid);
+  process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid);
+  if (!process)
+    return false;
+  std::wstring path;
+  std::wstring family;
+  const bool matches = ExternalSameUser(process) &&
+                       ExternalImagePath(process, path) &&
+                       ExternalPackageFamily(process, family) &&
+                       family == L"Microsoft.OutlookForWindows_8wekyb3d8bbwe" &&
+                       ExternalImageInPackage(process, path, L"olk.exe");
+  ::CloseHandle(process);
+  return matches;
 }
 
 bool IsExternalHostClass(HWND hwnd) {
@@ -689,22 +915,44 @@ bool ExternalServerAvailable(HWND hwnd) {
          ExternalProperty(hwnd, kAcrylicStageProperty) == 100;
 }
 
+bool ExternalCoordinatorOnly();
+
+struct ExternalServerSearch {
+  HWND window = nullptr;
+  DWORD stage = 1;  // 1 no advertised server; 2 policy; 3 filter; 4 identity.
+};
+
 BOOL CALLBACK FindExternalServerCallback(HWND hwnd, LPARAM parameter) {
   if (!ExternalServerAvailable(hwnd) ||
       (::IsWindowVisible(hwnd) && ExternalProperty(hwnd, kExtActive) != 1))
     return TRUE;
+  auto search = reinterpret_cast<ExternalServerSearch*>(parameter);
+  if (CurrentExternalKind() != ExternalClientKind::Settings &&
+      ExternalProperty(hwnd, kExtCompatibility) != 1) {
+    search->stage = 2;
+    return TRUE;
+  }
+  if (ExternalCoordinatorOnly() &&
+      ExternalProperty(hwnd, kExtLowMessages) != 1) {
+    search->stage = 3;
+    return TRUE;
+  }
   DWORD pid = 0;
   ::GetWindowThreadProcessId(hwnd, &pid);
-  if (!ExternalProcessMatches(pid, false))
+  if (!ExternalProcessMatches(pid, false)) {
+    search->stage = 4;
     return TRUE;
-  *reinterpret_cast<HWND*>(parameter) = hwnd;
+  }
+  search->window = hwnd;
+  search->stage = 0;
   return FALSE;
 }
 
-HWND FindExternalServer() {
-  HWND result = nullptr;
-  ::EnumWindows(FindExternalServerCallback, reinterpret_cast<LPARAM>(&result));
-  return result;
+HWND FindExternalServer(HWND client) {
+  ExternalServerSearch search;
+  ::EnumWindows(FindExternalServerCallback, reinterpret_cast<LPARAM>(&search));
+  SetExternalProperty(client, L"WeaselAcrylicExternalDiscovery", search.stage);
+  return search.window;
 }
 
 ExternalAcrylicState* MakeExternalState(HWND hwnd, bool server) {
@@ -727,6 +975,8 @@ void PrepareExternalServer(HWND hwnd) {
 #if defined(_M_X64) && !defined(_M_ARM64EC)
   if (!MakeExternalState(hwnd, true))
     return;
+  PrepareExternalLowMessages(hwnd);
+  SetExternalProperty(hwnd, kExtCompatibility, 1);
   if (!SetExternalProperty(hwnd, kExtProtocol, kExternalProtocol) ||
       !SetExternalProperty(hwnd, kExtServer, 1)) {
     ::RemovePropW(hwnd, kExtProtocol);
@@ -801,11 +1051,17 @@ void ApplyExternalSnapshot(HWND hwnd,
   ::GetWindowThreadProcessId(snap.candidate, &candidatePid);
   if (!clientPid || clientPid != candidatePid)
     return;
+  const bool compatibilityClient =
+      ExternalProperty(client, kExtCompatibility) == 1;
+  if (compatibilityClient && !ExternalNewClientGeometry(client, snap))
+    return;
   const bool sameLease = state->active && state->peer == client &&
                          state->token == token &&
                          state->candidate == snap.candidate;
   if (!sameLease) {
-    if (!ExternalProcessMatches(clientPid, true))
+    if (!ExternalProcessMatches(clientPid, true) ||
+        (compatibilityClient &&
+         !ExternalClientOwnerMatches(client, snap.candidate)))
       return;
     if (state->active && state->peer != client &&
         ExternalCandidateVisible(state->candidate))
@@ -827,9 +1083,25 @@ void ApplyExternalSnapshot(HWND hwnd,
                             sizeof(snap.dark));
     g_acrylicAppSdkBridge.SetDarkMode(hwnd, snap.dark);
   }
-  if (!::SetWindowPos(hwnd, snap.candidate, snap.x, snap.y, snap.width,
-                      snap.height,
-                      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER) ||
+  ::SetLastError(ERROR_SUCCESS);
+  const BOOL positioned = ::SetWindowPos(
+      hwnd, snap.candidate, snap.x, snap.y, snap.width, snap.height,
+      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+  const DWORD placementError = positioned ? ERROR_SUCCESS : ::GetLastError();
+  RECT placed = {};
+  const bool placementVerified =
+      !compatibilityClient ||
+      (positioned && ::GetWindowRect(hwnd, &placed) && placed.left == snap.x &&
+       placed.top == snap.y &&
+       static_cast<LONGLONG>(placed.right) - placed.left == snap.width &&
+       static_cast<LONGLONG>(placed.bottom) - placed.top == snap.height &&
+       ::GetWindow(snap.candidate, GW_HWNDNEXT) == hwnd);
+  SetExternalProperty(
+      hwnd, kExtPlacementError,
+      placementVerified && positioned
+          ? ERROR_SUCCESS
+          : (placementError ? placementError : ERROR_INVALID_WINDOW_HANDLE));
+  if (!positioned || !placementVerified ||
       !SetExternalProperty(hwnd, kExtOwner,
                            reinterpret_cast<ULONG_PTR>(snap.candidate)) ||
       !SetExternalProperty(hwnd, kExtAckClient,
@@ -975,7 +1247,7 @@ void RequestExternalSnapshot(HWND hwnd, ExternalAcrylicState* state) {
       return;
     state->lastAttempt = now;
     state->attempted = true;
-    state->peer = FindExternalServer();
+    state->peer = FindExternalServer(hwnd);
     if (!state->peer)
       return;
   }
@@ -985,12 +1257,16 @@ void RequestExternalSnapshot(HWND hwnd, ExternalAcrylicState* state) {
       ExternalProperty(state->peer, kExtAckSequence) ==
           state->snapshot.sequence)
     return;
+  ::SetLastError(ERROR_SUCCESS);
   if (::PostMessageW(state->peer, kExternalUpdate,
                      reinterpret_cast<WPARAM>(hwnd), state->token)) {
+    SetExternalProperty(hwnd, kExtPostError, ERROR_SUCCESS);
     state->pending = true;
     state->pendingSince = now;
     state->pendingSequence = state->snapshot.sequence;
   } else {
+    const DWORD error = ::GetLastError();
+    SetExternalProperty(hwnd, kExtPostError, error);
     state->peer = nullptr;
     state->lastAttempt = now;
   }
@@ -1004,7 +1280,7 @@ void SyncExternalClient(HWND hwnd,
                         int width,
                         int height,
                         BOOL dark) {
-  if (!hwnd || !IsExternalSettingsClient() || width <= 0 || height <= 0 ||
+  if (!hwnd || !IsExternalCompatibleClient() || width <= 0 || height <= 0 ||
       !ExternalCandidateVisible(candidate))
     return;
   auto state = MakeExternalState(hwnd, false);
@@ -1012,6 +1288,11 @@ void SyncExternalClient(HWND hwnd,
     return;
   state->candidate = candidate;
   state->panel = panel;
+  if (CurrentExternalKind() != ExternalClientKind::Settings) {
+    SetExternalProperty(hwnd, kExtCompatibility, 1);
+    SetExternalProperty(hwnd, kExtClientKind,
+                        static_cast<DWORD>(CurrentExternalKind()));
+  }
   if (!state->active) {
     state->token = NextExternalToken();
     state->snapshot.sequence = 0;
@@ -1142,6 +1423,45 @@ bool HandleExternalAcrylicMessage(HWND hwnd,
   return true;
 }
 
+void SetAcrylicCreationDiagnostic(HWND candidate, LONG stage, HRESULT hr) {
+  SetExternalProperty(candidate, kExtCompatibility, 1);
+  SetExternalProperty(candidate, kExtClientKind,
+                      static_cast<DWORD>(CurrentExternalKind()));
+  SetExternalProperty(candidate, kExtCreateStage, static_cast<DWORD>(stage));
+  SetExternalProperty(candidate, kExtCreateHr, static_cast<DWORD>(hr));
+}
+
+bool ExternalCoordinatorOnly() {
+  const auto kind = CurrentExternalKind();
+  if (kind != ExternalClientKind::Store && kind != ExternalClientKind::Search)
+    return false;
+  bool appContainer = false;
+  return ExternalAppContainer(::GetCurrentProcess(), appContainer) &&
+         appContainer;
+}
+
+HWND CreateExternalCoordinator(HWND candidate) {
+  // A message-only endpoint performs no DWM/COM initialization and is never
+  // displayed. A low-integrity client does not have to create a second visual
+  // window owned by the medium-integrity ApplicationFrameHost.
+  HWND hwnd =
+      ::CreateWindowExW(0, kWeaselAcrylicBackdropClass, L"", 0, 0, 0, 0, 0,
+                        HWND_MESSAGE, nullptr, AcrylicWindowModule(), nullptr);
+  const DWORD error = hwnd ? ERROR_SUCCESS : ::GetLastError();
+  SetAcrylicCreationDiagnostic(candidate, hwnd ? 20 : -20,
+                               HRESULT_FROM_WIN32(error));
+  if (hwnd) {
+    SetExternalProperty(candidate, kExtCoordinator,
+                        reinterpret_cast<ULONG_PTR>(hwnd));
+    SetExternalProperty(hwnd, kExtCandidate,
+                        reinterpret_cast<ULONG_PTR>(candidate));
+    SetExternalProperty(hwnd, kExtClientKind,
+                        static_cast<DWORD>(CurrentExternalKind()));
+    SetExternalProperty(hwnd, kExtCompatibility, 1);
+  }
+  return hwnd;
+}
+
 }  // namespace
 
 template <class t0, class t1, class t2>
@@ -1225,29 +1545,49 @@ WeaselPanel::~WeaselPanel() {
 
 bool WeaselPanel::_CreateAcrylicBackdrop() {
   m_acrylicBackdropEnabled = false;
-
-  if (!EnsureAcrylicBackdropClass())
+  SetAcrylicCreationDiagnostic(m_hWnd, 1, S_OK);
+  if (!EnsureAcrylicBackdropClass()) {
+    SetAcrylicCreationDiagnostic(m_hWnd, -1,
+                                 HRESULT_FROM_WIN32(::GetLastError()));
     return false;
+  }
+  if (!m_in_server && ExternalCoordinatorOnly()) {
+    m_acrylicBackdrop = CreateExternalCoordinator(m_hWnd);
+    return false;  // No local material; foreground stays opaque until ACK.
+  }
 
   m_acrylicBackdrop = CreateWindowExW(
       WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
       kWeaselAcrylicBackdropClass, L"", WS_POPUP, 0, 0, 0, 0,
       ::GetWindow(m_hWnd, GW_OWNER), nullptr, AcrylicWindowModule(), nullptr);
 
-  if (!m_acrylicBackdrop)
+  if (!m_acrylicBackdrop) {
+    SetAcrylicCreationDiagnostic(m_hWnd, -2,
+                                 HRESULT_FROM_WIN32(::GetLastError()));
+    if (!m_in_server && IsExternalCompatibleClient())
+      m_acrylicBackdrop = CreateExternalCoordinator(m_hWnd);
     return false;
-
+  }
+  SetExternalProperty(m_hWnd, kExtCoordinator,
+                      reinterpret_cast<ULONG_PTR>(m_acrylicBackdrop));
   MARGINS margins = {-1, -1, -1, -1};
-  if (FAILED(DwmExtendFrameIntoClientArea(m_acrylicBackdrop, &margins))) {
-    _DestroyAcrylicBackdrop();
-    return false;
+  const HRESULT frameHr =
+      DwmExtendFrameIntoClientArea(m_acrylicBackdrop, &margins);
+  if (FAILED(frameHr)) {
+    SetAcrylicCreationDiagnostic(m_hWnd, -3, frameHr);
+    if (m_in_server || !IsExternalCompatibleClient())
+      _DestroyAcrylicBackdrop();
+    return false;  // Compatible clients can use this hidden endpoint instead.
   }
 
   BOOL useHostBackdropBrush = TRUE;
-  if (FAILED(DwmSetWindowAttribute(m_acrylicBackdrop, kDwmaUseHostBackdropBrush,
-                                   &useHostBackdropBrush,
-                                   sizeof(useHostBackdropBrush)))) {
-    _DestroyAcrylicBackdrop();
+  const HRESULT brushHr = DwmSetWindowAttribute(
+      m_acrylicBackdrop, kDwmaUseHostBackdropBrush, &useHostBackdropBrush,
+      sizeof(useHostBackdropBrush));
+  if (FAILED(brushHr)) {
+    SetAcrylicCreationDiagnostic(m_hWnd, -4, brushHr);
+    if (m_in_server || !IsExternalCompatibleClient())
+      _DestroyAcrylicBackdrop();
     return false;
   }
 
@@ -1271,6 +1611,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
     ::SetPropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty,
                reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1)));
     m_acrylicBackdropEnabled = true;
+    SetAcrylicCreationDiagnostic(m_hWnd, 100, S_OK);
     if (m_in_server)
       PrepareExternalServer(m_acrylicBackdrop);
     return true;
@@ -1281,6 +1622,10 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
   // background alpha, border and shadow in DoPaint.
   // Keep the failed host hidden for Stage/HRESULT inspection; normal
   // window destruction will release it without changing the UI queue.
+  SetAcrylicCreationDiagnostic(
+      m_hWnd, -5,
+      static_cast<HRESULT>(static_cast<DWORD>(
+          ExternalProperty(m_acrylicBackdrop, kAcrylicHrProperty))));
   g_acrylicAppSdkBridge.DetachWindow(m_acrylicBackdrop);
   ::ShowWindow(m_acrylicBackdrop, SW_HIDE);
   return false;
@@ -1288,6 +1633,7 @@ bool WeaselPanel::_CreateAcrylicBackdrop() {
 void WeaselPanel::_DestroyAcrylicBackdrop() {
   RemoveLocalAcrylicGeometry(m_hWnd);
   DestroyExternalState(m_acrylicBackdrop);
+  ::RemovePropW(m_hWnd, kExtCoordinator);
   m_acrylicBackdropEnabled = false;
   if (m_acrylicBackdrop) {
     ::RemovePropW(m_acrylicBackdrop, kWeaselAcrylicAppSdkActiveProperty);
@@ -1311,7 +1657,8 @@ void WeaselPanel::_UpdateAcrylicBackdropTheme() {
 bool WeaselPanel::_ShouldShowAcrylicBackdrop() const {
   if (!m_acrylicBackdrop || !m_layout || hide_candidates)
     return false;
-  if (!m_acrylicBackdropEnabled && (m_in_server || !IsExternalSettingsClient()))
+  if (!m_acrylicBackdropEnabled &&
+      (m_in_server || !IsExternalCompatibleClient()))
     return false;
 
   return ((!m_ctx.empty() && !m_style.inline_preedit) ||
@@ -2447,7 +2794,9 @@ LRESULT WeaselPanel::OnCreate(UINT uMsg,
   m_mouse_entry = false;
   m_hoverIndex = -1;
   m_acrylicBackdropEnabled = _CreateAcrylicBackdrop();
-  if (m_acrylicBackdropEnabled)
+  if (m_acrylicBackdropEnabled ||
+      (m_acrylicBackdrop && !m_in_server && IsExternalCompatibleClient() &&
+       CurrentExternalKind() != ExternalClientKind::Settings))
     InstallLocalAcrylicGeometry(m_hWnd, this);
   Refresh();
   return TRUE;
